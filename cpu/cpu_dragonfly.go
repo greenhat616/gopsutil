@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package cpu
 
 import (
@@ -10,19 +11,22 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/shirou/gopsutil/internal/common"
 	"github.com/tklauser/go-sysconf"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-var ClocksPerSec = float64(128)
-var cpuMatch = regexp.MustCompile(`^CPU:`)
-var originMatch = regexp.MustCompile(`Origin\s*=\s*"(.+)"\s+Id\s*=\s*(.+)\s+Stepping\s*=\s*(.+)`)
-var featuresMatch = regexp.MustCompile(`Features=.+<(.+)>`)
-var featuresMatch2 = regexp.MustCompile(`Features2=[a-f\dx]+<(.+)>`)
-var cpuEnd = regexp.MustCompile(`^Trying to mount root`)
-var cpuTimesSize int
-var emptyTimes cpuTimes
+var (
+	ClocksPerSec   = float64(128)
+	cpuMatch       = regexp.MustCompile(`^CPU:`)
+	originMatch    = regexp.MustCompile(`Origin\s*=\s*"(.+)"\s+Id\s*=\s*(.+)\s+Stepping\s*=\s*(.+)`)
+	featuresMatch  = regexp.MustCompile(`Features=.+<(.+)>`)
+	featuresMatch2 = regexp.MustCompile(`Features2=[a-f\dx]+<(.+)>`)
+	cpuEnd         = regexp.MustCompile(`^Trying to mount root`)
+	cpuTimesSize   int
+	emptyTimes     cpuTimes
+)
 
 func init() {
 	clkTck, err := sysconf.Sysconf(sysconf.SC_CLK_TCK)
@@ -47,7 +51,7 @@ func Times(percpu bool) ([]TimesStat, error) {
 	return TimesWithContext(context.Background(), percpu)
 }
 
-func TimesWithContext(ctx context.Context, percpu bool) ([]TimesStat, error) {
+func TimesWithContext(_ context.Context, percpu bool) ([]TimesStat, error) {
 	if percpu {
 		buf, err := unix.SysctlRaw("kern.cp_times")
 		if err != nil {
@@ -88,7 +92,7 @@ func Info() ([]InfoStat, error) {
 	return InfoWithContext(context.Background())
 }
 
-func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
+func InfoWithContext(_ context.Context) ([]InfoStat, error) {
 	const dmesgBoot = "/var/run/dmesg.boot"
 
 	c, err := parseDmesgBoot(dmesgBoot)
@@ -124,7 +128,11 @@ func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
 
 func parseDmesgBoot(fileName string) (InfoStat, error) {
 	c := InfoStat{}
-	lines, _ := common.ReadLines(fileName)
+	lines, err := common.ReadLines(fileName)
+	if err != nil {
+		return c, fmt.Errorf("could not read %s: %w", fileName, err)
+	}
+
 	for _, line := range lines {
 		if matches := cpuEnd.FindStringSubmatch(line); matches != nil {
 			break
@@ -132,7 +140,7 @@ func parseDmesgBoot(fileName string) (InfoStat, error) {
 			c.VendorID = matches[1]
 			t, err := strconv.ParseInt(matches[2], 10, 32)
 			if err != nil {
-				return c, fmt.Errorf("unable to parse DragonflyBSD CPU stepping information from %q: %v", line, err)
+				return c, fmt.Errorf("unable to parse DragonflyBSD CPU stepping information from %q: %w", line, err)
 			}
 			c.Stepping = int32(t)
 		} else if matches := featuresMatch.FindStringSubmatch(line); matches != nil {
@@ -149,6 +157,6 @@ func parseDmesgBoot(fileName string) (InfoStat, error) {
 	return c, nil
 }
 
-func CountsWithContext(ctx context.Context, logical bool) (int, error) {
+func CountsWithContext(_ context.Context, _ bool) (int, error) {
 	return runtime.NumCPU(), nil
 }

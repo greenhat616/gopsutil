@@ -1,4 +1,5 @@
-// +build darwin freebsd openbsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build darwin || freebsd || openbsd || netbsd
 
 package host
 
@@ -7,22 +8,28 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 // cachedBootTime must be accessed via atomic.Load/StoreUint64
 var cachedBootTime uint64
 
-func BootTimeWithContext(ctx context.Context) (uint64, error) {
-	t := atomic.LoadUint64(&cachedBootTime)
-	if t != 0 {
-		return t, nil
+func BootTimeWithContext(_ context.Context) (uint64, error) {
+	if enableBootTimeCache {
+		t := atomic.LoadUint64(&cachedBootTime)
+		if t != 0 {
+			return t, nil
+		}
 	}
 	tv, err := unix.SysctlTimeval("kern.boottime")
 	if err != nil {
 		return 0, err
 	}
 
-	atomic.StoreUint64(&cachedBootTime, uint64(tv.Sec))
+	if enableBootTimeCache {
+		atomic.StoreUint64(&cachedBootTime, uint64(tv.Sec))
+	}
 
 	return uint64(tv.Sec), nil
 }
@@ -32,5 +39,5 @@ func UptimeWithContext(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return timeSince(boot), nil
+	return common.TimeSince(boot), nil
 }

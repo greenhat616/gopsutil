@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package net
 
 import (
@@ -38,7 +39,25 @@ func TestParseNetstatLineHeader(t *testing.T) {
 	assert.Equal(t, errNetstatHeader, err)
 }
 
+func TestParseNetstatLineInvalidColumnCount(t *testing.T) {
+	for _, line := range []string{
+		"",
+		"lo0",
+		"lo0 16384",
+		"lo0 16384 <Link#1> 0 0 0 0 0 0 0",
+		"lo0 16384 <Link#1> address 0 0 0 0 0 0 0 0 0 0",
+	} {
+		t.Run(line, func(t *testing.T) {
+			stat, linkID, err := parseNetstatLine(line)
+			assert.Nil(t, stat)
+			assert.Nil(t, linkID)
+			assert.Error(t, err)
+		})
+	}
+}
+
 func assertLoopbackStat(t *testing.T, err error, stat *IOCountersStat) {
+	t.Helper()
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(869107), stat.PacketsRecv)
 	assert.Equal(t, uint64(0), stat.Errin)
@@ -46,6 +65,15 @@ func assertLoopbackStat(t *testing.T, err error, stat *IOCountersStat) {
 	assert.Equal(t, uint64(869108), stat.PacketsSent)
 	assert.Equal(t, uint64(1), stat.Errout)
 	assert.Equal(t, uint64(169411756), stat.BytesSent)
+}
+
+func TestParseNetstatLineNoAddressWithDrop(t *testing.T) {
+	stat, linkID, err := parseNetstatLine(
+		`gif0* 1280  <Link#2>                             5     0          0        0     0          0     0   3`,
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, linkID)
+	assert.Equal(t, uint64(3), stat.Dropout)
 }
 
 func TestParseNetstatLineLink(t *testing.T) {
@@ -74,11 +102,10 @@ func TestParseNetstatLineIPv4(t *testing.T) {
 }
 
 func TestParseNetstatOutput(t *testing.T) {
-	nsInterfaces, err := parseNetstatOutput(netstatNotTruncated)
-	assert.NoError(t, err)
+	nsInterfaces := parseNetstatOutput(netstatNotTruncated)
 	assert.Len(t, nsInterfaces, 8)
 	for index := range nsInterfaces {
-		assert.NotNil(t, nsInterfaces[index].stat, "Index %d", index)
+		assert.NotNilf(t, nsInterfaces[index].stat, "Index %d", index)
 	}
 
 	assert.NotNil(t, nsInterfaces[0].linkID)
@@ -104,12 +131,30 @@ func TestParseNetstatOutput(t *testing.T) {
 	assert.Len(t, mapUsage.notTruncated(), 4)
 }
 
+func TestParseNetstatOutputSkipsMalformedLines(t *testing.T) {
+	diagnosticOutput := "netstat: sysctl IFDATA_SUPPLEMENTAL: Operation not permitted\nnetstat:"
+
+	for _, test := range []struct {
+		name      string
+		output    string
+		wantCount int
+	}{
+		{name: "diagnostics only", output: diagnosticOutput},
+		{name: "diagnostics before table", output: diagnosticOutput + "\n" + netstatNotTruncated, wantCount: 8},
+		{name: "diagnostics after table", output: netstatNotTruncated + "\n" + diagnosticOutput, wantCount: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			nsInterfaces := parseNetstatOutput(test.output)
+			assert.Len(t, nsInterfaces, test.wantCount)
+		})
+	}
+}
+
 func TestParseNetstatTruncated(t *testing.T) {
-	nsInterfaces, err := parseNetstatOutput(netstatTruncated)
-	assert.NoError(t, err)
+	nsInterfaces := parseNetstatOutput(netstatTruncated)
 	assert.Len(t, nsInterfaces, 11)
 	for index := range nsInterfaces {
-		assert.NotNil(t, nsInterfaces[index].stat, "Index %d", index)
+		assert.NotNilf(t, nsInterfaces[index].stat, "Index %d", index)
 	}
 
 	const truncatedIface = "utun8"
@@ -136,5 +181,5 @@ func TestParseNetstatTruncated(t *testing.T) {
 
 	mapUsage := newMapInterfaceNameUsage(nsInterfaces)
 	assert.True(t, mapUsage.isTruncated())
-	assert.Equal(t, 3, len(mapUsage.notTruncated()), "en0, gif0 and stf0")
+	assert.Lenf(t, mapUsage.notTruncated(), 3, "en0, gif0 and stf0")
 }

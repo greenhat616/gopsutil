@@ -1,15 +1,16 @@
-// +build linux
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build linux
 
 package load
 
 import (
 	"context"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 func Avg() (*AvgStat, error) {
@@ -19,28 +20,28 @@ func Avg() (*AvgStat, error) {
 func AvgWithContext(ctx context.Context) (*AvgStat, error) {
 	stat, err := fileAvgWithContext(ctx)
 	if err != nil {
-		stat, err = sysinfoAvgWithContext(ctx)
+		stat, err = sysinfoAvgWithContext()
 	}
 	return stat, err
 }
 
-func sysinfoAvgWithContext(ctx context.Context) (*AvgStat, error) {
+func sysinfoAvgWithContext() (*AvgStat, error) {
 	var info syscall.Sysinfo_t
 	err := syscall.Sysinfo(&info)
 	if err != nil {
 		return nil, err
 	}
 
-	const si_load_shift = 16
+	const siLoadShift = 16
 	return &AvgStat{
-		Load1:  float64(info.Loads[0]) / float64(1<<si_load_shift),
-		Load5:  float64(info.Loads[1]) / float64(1<<si_load_shift),
-		Load15: float64(info.Loads[2]) / float64(1<<si_load_shift),
+		Load1:  float64(info.Loads[0]) / float64(1<<siLoadShift),
+		Load5:  float64(info.Loads[1]) / float64(1<<siLoadShift),
+		Load15: float64(info.Loads[2]) / float64(1<<siLoadShift),
 	}, nil
 }
 
 func fileAvgWithContext(ctx context.Context) (*AvgStat, error) {
-	values, err := readLoadAvgFromFile()
+	values, err := readLoadAvgFromFile(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -67,15 +68,15 @@ func fileAvgWithContext(ctx context.Context) (*AvgStat, error) {
 	return ret, nil
 }
 
-// Misc returnes miscellaneous host-wide statistics.
+// Misc returns miscellaneous host-wide statistics.
 // Note: the name should be changed near future.
 func Misc() (*MiscStat, error) {
 	return MiscWithContext(context.Background())
 }
 
 func MiscWithContext(ctx context.Context) (*MiscStat, error) {
-	filename := common.HostProc("stat")
-	out, err := ioutil.ReadFile(filename)
+	filename := common.HostProcWithContext(ctx, "stat")
+	out, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +107,7 @@ func MiscWithContext(ctx context.Context) (*MiscStat, error) {
 
 	}
 
-	procsTotal, err := getProcsTotal()
+	procsTotal, err := common.NumProcsWithContext(ctx)
 	if err != nil {
 		return ret, err
 	}
@@ -115,17 +116,9 @@ func MiscWithContext(ctx context.Context) (*MiscStat, error) {
 	return ret, nil
 }
 
-func getProcsTotal() (int64, error) {
-	values, err := readLoadAvgFromFile()
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(strings.Split(values[3], "/")[1], 10, 64)
-}
-
-func readLoadAvgFromFile() ([]string, error) {
-	loadavgFilename := common.HostProc("loadavg")
-	line, err := ioutil.ReadFile(loadavgFilename)
+func readLoadAvgFromFile(ctx context.Context) ([]string, error) {
+	loadavgFilename := common.HostProcWithContext(ctx, "loadavg")
+	line, err := os.ReadFile(loadavgFilename)
 	if err != nil {
 		return nil, err
 	}

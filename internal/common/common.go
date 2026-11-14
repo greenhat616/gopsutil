@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package common
 
 //
@@ -6,13 +7,16 @@ package common
 //  - linux (amd64, arm)
 //  - freebsd (amd64)
 //  - windows (amd64)
+//  - aix (ppc64)
+
 import (
 	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -20,14 +24,18 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/common"
 )
 
 var (
-	Timeout    = 3 * time.Second
-	ErrTimeout = errors.New("command timed out")
+	Timeout                = 3 * time.Second
+	ErrNotImplementedError = errors.New("not implemented yet")
+	ErrTimeout             = errors.New("command timed out")
 )
 
 type Invoker interface {
@@ -43,7 +51,7 @@ func (i Invoke) Command(name string, arg ...string) ([]byte, error) {
 	return i.CommandWithContext(ctx, name, arg...)
 }
 
-func (i Invoke) CommandWithContext(ctx context.Context, name string, arg ...string) ([]byte, error) {
+func (Invoke) CommandWithContext(ctx context.Context, name string, arg ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, arg...)
 
 	var buf bytes.Buffer
@@ -63,7 +71,7 @@ func (i Invoke) CommandWithContext(ctx context.Context, name string, arg ...stri
 
 type FakeInvoke struct {
 	Suffix string // Suffix species expected file name suffix such as "fail"
-	Error  error  // If Error specfied, return the error.
+	Error  error  // If Error specified, return the error.
 }
 
 // Command in FakeInvoke returns from expected file if exists.
@@ -83,21 +91,18 @@ func (i FakeInvoke) Command(name string, arg ...string) ([]byte, error) {
 		fpath += "_" + i.Suffix
 	}
 	if PathExists(fpath) {
-		return ioutil.ReadFile(fpath)
+		return os.ReadFile(fpath)
 	}
 	return []byte{}, fmt.Errorf("could not find testdata: %s", fpath)
 }
 
-func (i FakeInvoke) CommandWithContext(ctx context.Context, name string, arg ...string) ([]byte, error) {
+func (i FakeInvoke) CommandWithContext(_ context.Context, name string, arg ...string) ([]byte, error) {
 	return i.Command(name, arg...)
 }
 
-var ErrNotImplementedError = errors.New("not implemented yet")
-
 // ReadFile reads contents from a file
 func ReadFile(filename string) (string, error) {
-	content, err := ioutil.ReadFile(filename)
-
+	content, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
@@ -111,11 +116,35 @@ func ReadLines(filename string) ([]string, error) {
 	return ReadLinesOffsetN(filename, 0, -1)
 }
 
-// ReadLines reads contents from file and splits them by new line.
+// ReadLine reads a file and returns the first occurrence of a line that is prefixed with prefix.
+func ReadLine(filename, prefix string) (string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return "", err
+		}
+		if strings.HasPrefix(line, prefix) {
+			return line, nil
+		}
+	}
+
+	return "", nil
+}
+
+// ReadLinesOffsetN reads contents from file and splits them by new line.
 // The offset tells at which line number to start.
 // The count determines the number of lines to read (starting from offset):
-//   n >= 0: at most n lines
-//   n < 0: whole file
+// n >= 0: at most n lines
+// n < 0: whole file
 func ReadLinesOffsetN(filename string, offset uint, n int) ([]string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -126,12 +155,15 @@ func ReadLinesOffsetN(filename string, offset uint, n int) ([]string, error) {
 	var ret []string
 
 	r := bufio.NewReader(f)
-	for i := 0; i < n+int(offset) || n < 0; i++ {
+	for i := uint(0); i < uint(n)+offset || n < 0; i++ {
 		line, err := r.ReadString('\n')
 		if err != nil {
+			if err == io.EOF && line != "" {
+				ret = append(ret, strings.Trim(line, "\n"))
+			}
 			break
 		}
-		if i < int(offset) {
+		if i < offset {
 			continue
 		}
 		ret = append(ret, strings.Trim(line, "\n"))
@@ -260,29 +292,21 @@ func StringsHas(target []string, src string) bool {
 
 // StringsContains checks the src in any string of the target string slice
 func StringsContains(target []string, src string) bool {
-	for _, t := range target {
-		if strings.Contains(t, src) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(target, func(s string) bool {
+		return strings.Contains(s, src)
+	})
 }
 
 // IntContains checks the src in any int of the target int slice.
 func IntContains(target []int, src int) bool {
-	for _, t := range target {
-		if src == t {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(target, src)
 }
 
 // get struct attributes.
 // This method is used only for debugging platform dependent code.
-func attributes(m interface{}) map[string]reflect.Type {
+func attributes(m any) map[string]reflect.Type {
 	typ := reflect.TypeOf(m)
-	if typ.Kind() == reflect.Ptr {
+	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
 
@@ -308,13 +332,43 @@ func PathExists(filename string) bool {
 	return false
 }
 
-//GetEnv retrieves the environment variable key. If it does not exist it returns the default.
-func GetEnv(key string, dfault string, combineWith ...string) string {
+// PathExistsWithContents returns the filename exists and it is not empty
+func PathExistsWithContents(filename string) bool {
+	info, err := os.Stat(filename)
+	if err != nil {
+		return false
+	}
+	return info.Size() > 4 && !info.IsDir() // at least 4 bytes
+}
+
+// GetEnvWithContext retrieves the environment variable key. If it does not exist it returns the default.
+// The context may optionally contain a map superseding os.EnvKey.
+func GetEnvWithContext(ctx context.Context, key, dfault string, combineWith ...string) string {
+	var value string
+	if env, ok := ctx.Value(common.EnvKey).(common.EnvMap); ok {
+		value = env[common.EnvKeyType(key)]
+	}
+	if value == "" {
+		value = os.Getenv(key)
+	}
+	if value == "" {
+		value = dfault
+	}
+
+	return combine(value, combineWith)
+}
+
+// GetEnv retrieves the environment variable key. If it does not exist it returns the default.
+func GetEnv(key, dfault string, combineWith ...string) string {
 	value := os.Getenv(key)
 	if value == "" {
 		value = dfault
 	}
 
+	return combine(value, combineWith)
+}
+
+func combine(value string, combineWith []string) string {
 	switch len(combineWith) {
 	case 0:
 		return value
@@ -352,8 +406,44 @@ func HostDev(combineWith ...string) string {
 	return GetEnv("HOST_DEV", "/dev", combineWith...)
 }
 
+func HostRoot(combineWith ...string) string {
+	return GetEnv("HOST_ROOT", "/", combineWith...)
+}
+
+func HostProcWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_PROC", "/proc", combineWith...)
+}
+
+func HostProcMountInfoWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_PROC_MOUNTINFO", "", combineWith...)
+}
+
+func HostSysWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_SYS", "/sys", combineWith...)
+}
+
+func HostEtcWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_ETC", "/etc", combineWith...)
+}
+
+func HostVarWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_VAR", "/var", combineWith...)
+}
+
+func HostRunWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_RUN", "/run", combineWith...)
+}
+
+func HostDevWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_DEV", "/dev", combineWith...)
+}
+
+func HostRootWithContext(ctx context.Context, combineWith ...string) string {
+	return GetEnvWithContext(ctx, "HOST_ROOT", "/", combineWith...)
+}
+
 // getSysctrlEnv sets LC_ALL=C in a list of env vars for use when running
-// sysctl commands (see DoSysctrl).
+// sysctl commands.
 func getSysctrlEnv(env []string) []string {
 	foundLC := false
 	for i, line := range env {
@@ -366,4 +456,20 @@ func getSysctrlEnv(env []string) []string {
 		env = append(env, "LC_ALL=C")
 	}
 	return env
+}
+
+// Round places rounds the number 'val' to 'n' decimal places
+func Round(val float64, n int) float64 {
+	// Calculate the power of 10 to the n
+	pow10 := math.Pow(10, float64(n))
+	// Multiply the value by pow10, round it, then divide it by pow10
+	return math.Round(val*pow10) / pow10
+}
+
+func TimeSince(ts uint64) uint64 {
+	return uint64(time.Now().Unix()) - ts
+}
+
+func TimeSinceMillis(ts uint64) uint64 {
+	return uint64(time.Now().UnixMilli()) - ts
 }

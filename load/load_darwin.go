@@ -1,10 +1,10 @@
-// +build darwin
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build darwin
 
 package load
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"unsafe"
 
@@ -15,7 +15,7 @@ func Avg() (*AvgStat, error) {
 	return AvgWithContext(context.Background())
 }
 
-func AvgWithContext(ctx context.Context) (*AvgStat, error) {
+func AvgWithContext(_ context.Context) (*AvgStat, error) {
 	// This SysctlRaw method borrowed from
 	// https://github.com/prometheus/node_exporter/blob/master/collector/loadavg_freebsd.go
 	// this implementation is common with BSDs
@@ -38,7 +38,7 @@ func AvgWithContext(ctx context.Context) (*AvgStat, error) {
 	return ret, nil
 }
 
-// Misc returnes miscellaneous host-wide statistics.
+// Misc returns miscellaneous host-wide statistics.
 // darwin use ps command to get process running/blocked count.
 // Almost same as FreeBSD implementation, but state is different.
 // U means 'Uninterruptible Sleep'.
@@ -47,11 +47,7 @@ func Misc() (*MiscStat, error) {
 }
 
 func MiscWithContext(ctx context.Context) (*MiscStat, error) {
-	bin, err := exec.LookPath("ps")
-	if err != nil {
-		return nil, err
-	}
-	out, err := invoke.CommandWithContext(ctx, bin, "axo", "state")
+	out, err := invoke.CommandWithContext(ctx, "ps", "axo", "state")
 	if err != nil {
 		return nil, err
 	}

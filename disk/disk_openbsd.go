@@ -1,4 +1,5 @@
-// +build openbsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build openbsd
 
 package disk
 
@@ -7,11 +8,12 @@ import (
 	"context"
 	"encoding/binary"
 
-	"github.com/shirou/gopsutil/internal/common"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func PartitionsWithContext(ctx context.Context, all bool) ([]PartitionStat, error) {
+func PartitionsWithContext(_ context.Context, _ bool) ([]PartitionStat, error) {
 	var ret []PartitionStat
 
 	// get length
@@ -25,40 +27,41 @@ func PartitionsWithContext(ctx context.Context, all bool) ([]PartitionStat, erro
 		return ret, err
 	}
 
-	for _, stat := range fs {
-		opts := "rw"
+	for i := range fs {
+		stat := &fs[i]
+		opts := []string{"rw"}
 		if stat.F_flags&unix.MNT_RDONLY != 0 {
-			opts = "ro"
+			opts = []string{"rw"}
 		}
 		if stat.F_flags&unix.MNT_SYNCHRONOUS != 0 {
-			opts += ",sync"
+			opts = append(opts, "sync")
 		}
 		if stat.F_flags&unix.MNT_NOEXEC != 0 {
-			opts += ",noexec"
+			opts = append(opts, "noexec")
 		}
 		if stat.F_flags&unix.MNT_NOSUID != 0 {
-			opts += ",nosuid"
+			opts = append(opts, "nosuid")
 		}
 		if stat.F_flags&unix.MNT_NODEV != 0 {
-			opts += ",nodev"
+			opts = append(opts, "nodev")
 		}
 		if stat.F_flags&unix.MNT_ASYNC != 0 {
-			opts += ",async"
+			opts = append(opts, "async")
 		}
 		if stat.F_flags&unix.MNT_SOFTDEP != 0 {
-			opts += ",softdep"
+			opts = append(opts, "softdep")
 		}
 		if stat.F_flags&unix.MNT_NOATIME != 0 {
-			opts += ",noatime"
+			opts = append(opts, "noatime")
 		}
 		if stat.F_flags&unix.MNT_WXALLOWED != 0 {
-			opts += ",wxallowed"
+			opts = append(opts, "wxallowed")
 		}
 
 		d := PartitionStat{
-			Device:     common.IntToString(stat.F_mntfromname[:]),
-			Mountpoint: common.IntToString(stat.F_mntonname[:]),
-			Fstype:     common.IntToString(stat.F_fstypename[:]),
+			Device:     common.ByteToString(stat.F_mntfromname[:]),
+			Mountpoint: common.ByteToString(stat.F_mntonname[:]),
+			Fstype:     common.ByteToString(stat.F_fstypename[:]),
 			Opts:       opts,
 		}
 
@@ -68,7 +71,7 @@ func PartitionsWithContext(ctx context.Context, all bool) ([]PartitionStat, erro
 	return ret, nil
 }
 
-func IOCountersWithContext(ctx context.Context, names ...string) (map[string]IOCountersStat, error) {
+func IOCountersWithContext(_ context.Context, names ...string) (map[string]IOCountersStat, error) {
 	ret := make(map[string]IOCountersStat)
 
 	r, err := unix.SysctlRaw("hw.diskstats")
@@ -111,16 +114,14 @@ func IOCountersWithContext(ctx context.Context, names ...string) (map[string]IOC
 func parseDiskstats(buf []byte) (Diskstats, error) {
 	var ds Diskstats
 	br := bytes.NewReader(buf)
-	//	err := binary.Read(br, binary.LittleEndian, &ds)
-	err := common.Read(br, binary.LittleEndian, &ds)
-	if err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &ds); err != nil {
 		return ds, err
 	}
 
 	return ds, nil
 }
 
-func UsageWithContext(ctx context.Context, path string) (*UsageStat, error) {
+func UsageWithContext(_ context.Context, path string) (*UsageStat, error) {
 	stat := unix.Statfs_t{}
 	err := unix.Statfs(path, &stat)
 	if err != nil {
@@ -133,8 +134,8 @@ func UsageWithContext(ctx context.Context, path string) (*UsageStat, error) {
 		Fstype:      getFsType(stat),
 		Total:       (uint64(stat.F_blocks) * uint64(bsize)),
 		Free:        (uint64(stat.F_bavail) * uint64(bsize)),
-		InodesTotal: (uint64(stat.F_files)),
-		InodesFree:  (uint64(stat.F_ffree)),
+		InodesTotal: uint64(stat.F_files),
+		InodesFree:  uint64(stat.F_ffree),
 	}
 
 	ret.InodesUsed = (ret.InodesTotal - ret.InodesFree)
@@ -146,5 +147,13 @@ func UsageWithContext(ctx context.Context, path string) (*UsageStat, error) {
 }
 
 func getFsType(stat unix.Statfs_t) string {
-	return common.IntToString(stat.F_fstypename[:])
+	return common.ByteToString(stat.F_fstypename[:])
+}
+
+func SerialNumberWithContext(_ context.Context, _ string) (string, error) {
+	return "", common.ErrNotImplementedError
+}
+
+func LabelWithContext(_ context.Context, _ string) (string, error) {
+	return "", common.ErrNotImplementedError
 }

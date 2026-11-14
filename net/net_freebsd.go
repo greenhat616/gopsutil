@@ -1,26 +1,23 @@
-// +build freebsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build freebsd
 
 package net
 
 import (
 	"context"
-	"os/exec"
 	"strconv"
 	"strings"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func IOCounters(pernic bool) ([]IOCountersStat, error) {
-	return IOCountersWithContext(context.Background(), pernic)
+// Deprecated: use process.PidsWithContext instead
+func PidsWithContext(_ context.Context) ([]int32, error) {
+	return nil, common.ErrNotImplementedError
 }
 
 func IOCountersWithContext(ctx context.Context, pernic bool) ([]IOCountersStat, error) {
-	netstat, err := exec.LookPath("netstat")
-	if err != nil {
-		return nil, err
-	}
-	out, err := invoke.CommandWithContext(ctx, netstat, "-ibdnW")
+	out, err := invoke.CommandWithContext(ctx, "netstat", "-ibdnW")
 	if err != nil {
 		return nil, err
 	}
@@ -87,46 +84,25 @@ func IOCountersWithContext(ctx context.Context, pernic bool) ([]IOCountersStat, 
 		ret = append(ret, n)
 	}
 
-	if pernic == false {
-		return getIOCountersAll(ret)
+	if !pernic {
+		return getIOCountersAll(ret), nil
 	}
 
 	return ret, nil
 }
 
-// NetIOCountersByFile is an method which is added just a compatibility for linux.
-func IOCountersByFile(pernic bool, filename string) ([]IOCountersStat, error) {
-	return IOCountersByFileWithContext(context.Background(), pernic, filename)
+func IOCountersByFileWithContext(ctx context.Context, pernic bool, _ string) ([]IOCountersStat, error) {
+	return IOCountersWithContext(ctx, pernic)
 }
 
-func IOCountersByFileWithContext(ctx context.Context, pernic bool, filename string) ([]IOCountersStat, error) {
-	return IOCounters(pernic)
-}
-
-func FilterCounters() ([]FilterStat, error) {
-	return FilterCountersWithContext(context.Background())
-}
-
-func FilterCountersWithContext(ctx context.Context) ([]FilterStat, error) {
+func FilterCountersWithContext(_ context.Context) ([]FilterStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func ConntrackStats(percpu bool) ([]ConntrackStat, error) {
-	return ConntrackStatsWithContext(context.Background(), percpu)
-}
-
-func ConntrackStatsWithContext(ctx context.Context, percpu bool) ([]ConntrackStat, error) {
+func ConntrackStatsWithContext(_ context.Context, _ bool) ([]ConntrackStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-// NetProtoCounters returns network statistics for the entire system
-// If protocols is empty then all protocols are returned, otherwise
-// just the protocols in the list are returned.
-// Not Implemented for FreeBSD
-func ProtoCounters(protocols []string) ([]ProtoCountersStat, error) {
-	return ProtoCountersWithContext(context.Background(), protocols)
-}
-
-func ProtoCountersWithContext(ctx context.Context, protocols []string) ([]ProtoCountersStat, error) {
+func ProtoCountersWithContext(_ context.Context, _ []string) ([]ProtoCountersStat, error) {
 	return nil, common.ErrNotImplementedError
 }

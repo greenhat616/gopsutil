@@ -1,25 +1,29 @@
-// +build linux
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build linux
 
 package disk
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/shirou/gopsutil/internal/common"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 const (
-	SectorSize = 512
+	sectorSize = 512
 )
+
 const (
 	// man statfs
 	ADFS_SUPER_MAGIC      = 0xadf5
@@ -97,8 +101,13 @@ const (
 	AFS_SUPER_MAGIC             = 0x5346414F
 	AUFS_SUPER_MAGIC            = 0x61756673
 	ANON_INODE_FS_SUPER_MAGIC   = 0x09041934
+	BCACHEFS_SUPER_MAGIC        = 0xCA451A4E
+	BPF_FS_MAGIC                = 0xCAFE4A11
 	CEPH_SUPER_MAGIC            = 0x00C36400
+	CGROUP2_SUPER_MAGIC         = 0x63677270
+	CONFIGFS_MAGIC              = 0x62656570
 	ECRYPTFS_SUPER_MAGIC        = 0xF15F
+	F2FS_SUPER_MAGIC            = 0xF2F52010
 	FAT_SUPER_MAGIC             = 0x4006
 	FHGFS_SUPER_MAGIC           = 0x19830326
 	FUSEBLK_SUPER_MAGIC         = 0x65735546
@@ -113,9 +122,11 @@ const (
 	KAFS_SUPER_MAGIC            = 0x6B414653
 	LUSTRE_SUPER_MAGIC          = 0x0BD00BD0
 	NFSD_SUPER_MAGIC            = 0x6E667364
+	NSFS_MAGIC                  = 0x6E736673
 	PANFS_SUPER_MAGIC           = 0xAAD7AAEA
 	RPC_PIPEFS_SUPER_MAGIC      = 0x67596969
 	SECURITYFS_SUPER_MAGIC      = 0x73636673
+	TRACEFS_MAGIC               = 0x74726163
 	UFS_BYTESWAPPED_SUPER_MAGIC = 0x54190100
 	VMHGFS_SUPER_MAGIC          = 0xBACBACBC
 	VZFS_SUPER_MAGIC            = 0x565A4653
@@ -130,25 +141,31 @@ var fsTypeMap = map[int64]string{
 	ANON_INODE_FS_SUPER_MAGIC: "anon-inode FS", /* 0x09041934 local */
 	AUFS_SUPER_MAGIC:          "aufs",          /* 0x61756673 remote */
 	//	AUTOFS_SUPER_MAGIC:          "autofs",              /* 0x0187 local */
+	BCACHEFS_SUPER_MAGIC:        "bcachefs",            /* 0xCA451A4E local */
 	BEFS_SUPER_MAGIC:            "befs",                /* 0x42465331 local */
 	BDEVFS_MAGIC:                "bdevfs",              /* 0x62646576 local */
 	BFS_MAGIC:                   "bfs",                 /* 0x1BADFACE local */
 	BINFMTFS_MAGIC:              "binfmt_misc",         /* 0x42494E4D local */
+	BPF_FS_MAGIC:                "bpf",                 /* 0xCAFE4A11 local */
 	BTRFS_SUPER_MAGIC:           "btrfs",               /* 0x9123683E local */
 	CEPH_SUPER_MAGIC:            "ceph",                /* 0x00C36400 remote */
 	CGROUP_SUPER_MAGIC:          "cgroupfs",            /* 0x0027E0EB local */
+	CGROUP2_SUPER_MAGIC:         "cgroup2fs",           /* 0x63677270 local */
 	CIFS_MAGIC_NUMBER:           "cifs",                /* 0xFF534D42 remote */
 	CODA_SUPER_MAGIC:            "coda",                /* 0x73757245 remote */
 	COH_SUPER_MAGIC:             "coh",                 /* 0x012FF7B7 local */
+	CONFIGFS_MAGIC:              "configfs",            /* 0x62656570 local */
 	CRAMFS_MAGIC:                "cramfs",              /* 0x28CD3D45 local */
 	DEBUGFS_MAGIC:               "debugfs",             /* 0x64626720 local */
 	DEVFS_SUPER_MAGIC:           "devfs",               /* 0x1373 local */
 	DEVPTS_SUPER_MAGIC:          "devpts",              /* 0x1CD1 local */
 	ECRYPTFS_SUPER_MAGIC:        "ecryptfs",            /* 0xF15F local */
+	EFIVARFS_MAGIC:              "efivarfs",            /* 0xDE5E81E4 local */
 	EFS_SUPER_MAGIC:             "efs",                 /* 0x00414A53 local */
 	EXT_SUPER_MAGIC:             "ext",                 /* 0x137D local */
 	EXT2_SUPER_MAGIC:            "ext2/ext3",           /* 0xEF53 local */
 	EXT2_OLD_SUPER_MAGIC:        "ext2",                /* 0xEF51 local */
+	F2FS_SUPER_MAGIC:            "f2fs",                /* 0xF2F52010 local */
 	FAT_SUPER_MAGIC:             "fat",                 /* 0x4006 local */
 	FHGFS_SUPER_MAGIC:           "fhgfs",               /* 0x19830326 remote */
 	FUSEBLK_SUPER_MAGIC:         "fuseblk",             /* 0x65735546 remote */
@@ -181,6 +198,7 @@ var fsTypeMap = map[int64]string{
 	NFS_SUPER_MAGIC:             "nfs",                 /* 0x6969 remote */
 	NFSD_SUPER_MAGIC:            "nfsd",                /* 0x6E667364 remote */
 	NILFS_SUPER_MAGIC:           "nilfs",               /* 0x3434 local */
+	NSFS_MAGIC:                  "nsfs",                /* 0x6E736673 local */
 	NTFS_SB_MAGIC:               "ntfs",                /* 0x5346544E local */
 	OPENPROM_SUPER_MAGIC:        "openprom",            /* 0x9FA1 local */
 	OCFS2_SUPER_MAGIC:           "ocfs2",               /* 0x7461636f remote */
@@ -203,6 +221,7 @@ var fsTypeMap = map[int64]string{
 	SYSV2_SUPER_MAGIC:           "sysv2",               /* 0x012FF7B6 local */
 	SYSV4_SUPER_MAGIC:           "sysv4",               /* 0x012FF7B5 local */
 	TMPFS_MAGIC:                 "tmpfs",               /* 0x01021994 local */
+	TRACEFS_MAGIC:               "tracefs",             /* 0x74726163 local */
 	UDF_SUPER_MAGIC:             "udf",                 /* 0x15013346 local */
 	UFS_MAGIC:                   "ufs",                 /* 0x00011954 local */
 	UFS_BYTESWAPPED_SUPER_MAGIC: "ufs",                 /* 0x54190100 local */
@@ -218,115 +237,249 @@ var fsTypeMap = map[int64]string{
 	ZFS_SUPER_MAGIC:             "zfs",                 /* 0x2FC12FC1 local */
 }
 
-func PartitionsWithContext(ctx context.Context, all bool) ([]PartitionStat, error) {
-	useMounts := false
-
-	filename := common.HostProc("self/mountinfo")
-	lines, err := common.ReadLines(filename)
+// readMountFile reads mountinfo or mounts file under the specified root path
+// (eg, /proc/1, /proc/self, etc)
+func readMountFile(root string) (lines []string, useMounts bool, filename string, err error) {
+	filename = path.Join(root, "mountinfo")
+	lines, err = common.ReadLines(filename)
 	if err != nil {
-		if err != err.(*os.PathError) {
+		var pathErr *os.PathError
+		if !errors.As(err, &pathErr) {
+			return lines, useMounts, filename, err
+		}
+		// if kernel does not support 1/mountinfo, fallback to 1/mounts (<2.6.26)
+		useMounts = true
+		filename = path.Join(root, "mounts")
+		lines, err = common.ReadLines(filename)
+		if err != nil {
+			return lines, useMounts, filename, err
+		}
+		return lines, useMounts, filename, err
+	}
+	return lines, useMounts, filename, err
+}
+
+func PartitionsWithContext(ctx context.Context, all bool) ([]PartitionStat, error) {
+	// by default, try "/proc/1/..." first
+	root := common.HostProcWithContext(ctx, path.Join("1"))
+
+	// force preference for dirname of HOST_PROC_MOUNTINFO, if set  #1271
+	hpmPath := common.HostProcMountInfoWithContext(ctx)
+	if hpmPath != "" {
+		root = filepath.Dir(hpmPath)
+	}
+
+	lines, useMounts, filename, err := readMountFile(root)
+	if err != nil {
+		if hpmPath != "" { // don't fallback with HOST_PROC_MOUNTINFO
 			return nil, err
 		}
-		// if kernel does not support self/mountinfo, fallback to self/mounts (<2.6.26)
-		useMounts = true
-		filename = common.HostProc("self/mounts")
-		lines, err = common.ReadLines(filename)
+		// fallback to "/proc/self/..."  #1159
+		lines, useMounts, filename, err = readMountFile(common.HostProcWithContext(ctx, path.Join("self")))
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	fs, err := getFileSystems()
+	fs, err := getFileSystems(ctx)
 	if err != nil && !all {
 		return nil, err
 	}
 
-	ret := make([]PartitionStat, 0, len(lines))
+	var ret []PartitionStat
+	if useMounts { // use mounts file
+		ret = parseFieldsOnMounts(lines, all, fs)
+		return ret, nil
+	}
 
-	for _, line := range lines {
-		var d PartitionStat
-		if useMounts {
-			fields := strings.Fields(line)
-
-			d = PartitionStat{
-				Device:     fields[0],
-				Mountpoint: unescapeFstab(fields[1]),
-				Fstype:     fields[2],
-				Opts:       fields[3],
-			}
-
-			if !all {
-				if d.Device == "none" || !common.StringsHas(fs, d.Fstype) {
-					continue
-				}
-			}
-		} else {
-			// a line of self/mountinfo has the following structure:
-			// 36  35  98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
-			// (1) (2) (3)   (4)   (5)      (6)      (7)   (8) (9)   (10)         (11)
-
-			// split the mountinfo line by the separator hyphen
-			parts := strings.Split(line, " - ")
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("found invalid mountinfo line in file %s: %s ", filename, line)
-			}
-
-			fields := strings.Fields(parts[0])
-			blockDeviceID := fields[2]
-			mountPoint := fields[4]
-			mountOpts := fields[5]
-
-			if rootDir := fields[3]; rootDir != "" && rootDir != "/" {
-				if len(mountOpts) == 0 {
-					mountOpts = "bind"
-				} else {
-					mountOpts = "bind," + mountOpts
-				}
-			}
-
-			fields = strings.Fields(parts[1])
-			fstype := fields[0]
-			device := fields[1]
-
-			d = PartitionStat{
-				Device:     device,
-				Mountpoint: unescapeFstab(mountPoint),
-				Fstype:     fstype,
-				Opts:       mountOpts,
-			}
-
-			if !all {
-				if d.Device == "none" || !common.StringsHas(fs, d.Fstype) {
-					continue
-				}
-			}
-
-			if strings.HasPrefix(d.Device, "/dev/mapper/") {
-				devpath, err := filepath.EvalSymlinks(common.HostDev(strings.Replace(d.Device, "/dev", "", -1)))
-				if err == nil {
-					d.Device = devpath
-				}
-			}
-
-			// /dev/root is not the real device name
-			// so we get the real device name from its major/minor number
-			if d.Device == "/dev/root" {
-				devpath, err := os.Readlink(common.HostSys("/dev/block/" + blockDeviceID))
-				if err != nil {
-					return nil, err
-				}
-				d.Device = strings.Replace(d.Device, "root", filepath.Base(devpath), 1)
-			}
-		}
-		ret = append(ret, d)
+	// use mountinfo
+	ret, err = parseFieldsOnMountinfo(ctx, lines, all, fs, filename)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing mountinfo file %s: %w", filename, err)
 	}
 
 	return ret, nil
 }
 
+func parseFieldsOnMounts(lines []string, all bool, fs []string) []PartitionStat {
+	ret := make([]PartitionStat, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		d := PartitionStat{
+			Device:     fields[0],
+			Mountpoint: unescapeFstab(fields[1]),
+			Fstype:     fields[2],
+			Opts:       strings.Split(fields[3], ","),
+		}
+
+		if !all {
+			if d.Device == "none" || !common.StringsHas(fs, d.Fstype) {
+				continue
+			}
+		}
+		ret = append(ret, d)
+	}
+
+	return ret
+}
+
+func parseFieldsOnMountinfo(ctx context.Context, lines []string, all bool, fs []string, filename string) ([]PartitionStat, error) {
+	ret := make([]PartitionStat, 0, len(lines))
+	seenDevIDs := make(map[string]string)
+
+	for _, line := range lines {
+		// See proc_pid_mountinfo(5) (proc(5) on EL)
+		// A line of <filename> (<procfs root>/<pid>/mountinfo) has the following structure:
+		//	36  35  98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+		//	(1) (2) (3)   (4)   (5)      (6)      (7)   (8) (9)   (10)         (11)
+		// Documentation is unclear if (6) is optional/may not be present, so it is conditionally parsed if present.
+		// (7) is optional and may not be present, but this function does not currently use it.
+		// Documentation is unclear if (11) is optional or not but this function does not currently use it.
+
+		// split the mountinfo line by the separator hyphen (`(8)` above)
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("found invalid mountinfo line in file %s (bad parts len): %s ", filename, line)
+		}
+
+		fields := strings.Fields(parts[0])
+		if len(fields) < 5 { // field (7) is optional, field (6) may(?) be optional
+			return nil, fmt.Errorf("found invalid mountinfo line in file %s (bad fields(1) len): %s ", filename, line)
+		}
+		blockDeviceID := fields[2]
+		rootDir := fields[3]
+		mountPoint := fields[4]
+		mountOpts := []string{}
+		if len(fields) >= 6 {
+			mountOpts = strings.Split(fields[5], ",")
+		}
+		fields = strings.Fields(parts[1])
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("found invalid mountinfo line in file %s (bad fields(2) len): %s ", filename, line)
+		}
+		fsType := fields[0]
+		mntSrc := fields[1]
+		superOpts := []string{}
+		if len(fields) >= 3 {
+			superOpts = strings.Split(fields[2], ",")
+		}
+		// Since Linux 2.6.16, read-only can be set independently on the
+		// mount point and the filesystem superblock. The mount is writable
+		// only when both option sets are read-write.
+		mountOpts = effectiveMountOpts(mountOpts, superOpts)
+		isBind := false
+		// When !all, keep only real filesystems (non-"nodev" entries of
+		// /proc/filesystems plus zfs), as parseFieldsOnMounts() does.
+		if !all && !common.StringsHas(fs, fsType) {
+			continue
+		}
+		// Some virtual/non-storage filesystems do still have real sources (e.g. nsfs binds),
+		// but need to use the "root" field (field 4) instead of the "source" field (field 10).
+		// The "source" field is actually "*filesystem-specific" information".
+		device := rootDir
+		if strings.HasPrefix(mntSrc, "/") {
+			device = mntSrc
+		} else if rootDir == "/" {
+			device = mntSrc
+		}
+
+		// Track device paths by block device ID to resolve bind mounts.
+		// A bind mount is identified by rootDir != "/" (mounting a subdirectory of a filesystem).
+		// Only apply bind detection for storage-backed filesystems (mntSrc starts with "/"),
+		// since virtual filesystems (e.g. nsfs) use rootDir for non-path identifiers.
+		if firstDev, ok := seenDevIDs[blockDeviceID]; ok {
+			// Same block device seen before - use the original device path.
+			device = firstDev
+		}
+		// A btrfs subvolume mount has rootDir == its subvol= value and is not a
+		// bind; a bind of a subdirectory has a deeper rootDir than subvol=.
+		isSubvol := false
+		for _, o := range superOpts {
+			if v, ok := strings.CutPrefix(o, "subvol="); ok {
+				isSubvol = rootDir == v
+				break
+			}
+		}
+		if strings.HasPrefix(mntSrc, "/") && rootDir != "/" && !isSubvol {
+			isBind = true
+			mountOpts = append(mountOpts, "bind")
+		}
+		if _, ok := seenDevIDs[blockDeviceID]; !ok {
+			seenDevIDs[blockDeviceID] = device
+		}
+
+		if !all && isBind {
+			continue
+		}
+
+		d := PartitionStat{
+			Device:     device,
+			Mountpoint: unescapeFstab(mountPoint),
+			Fstype:     fsType,
+			Opts:       mountOpts,
+		}
+
+		if strings.HasPrefix(d.Device, "/dev/mapper/") {
+			devpath, err := filepath.EvalSymlinks(common.HostDevWithContext(ctx, strings.Replace(d.Device, "/dev", "", 1)))
+			if err == nil {
+				d.Device = devpath
+			}
+		}
+
+		// /dev/root is not the real device name
+		// so we get the real device name from its major/minor number
+		if d.Device == "/dev/root" {
+			devpath, err := os.Readlink(common.HostSysWithContext(ctx, "/dev/block/"+blockDeviceID))
+			if err == nil {
+				d.Device = strings.Replace(d.Device, "root", filepath.Base(devpath), 1)
+			}
+		}
+		ret = append(ret, d)
+	}
+	return ret, nil
+}
+
+func effectiveMountOpts(mountOpts, superOpts []string) []string {
+	mode := effectiveReadWriteMode(mountOpts, superOpts)
+	if mode == "" {
+		return mountOpts
+	}
+
+	updated := make([]string, 0, len(mountOpts)+1)
+	modeSet := false
+	for _, opt := range mountOpts {
+		if opt == "ro" || opt == "rw" {
+			if !modeSet {
+				updated = append(updated, mode)
+				modeSet = true
+			}
+			continue
+		}
+		updated = append(updated, opt)
+	}
+	if !modeSet {
+		updated = append([]string{mode}, updated...)
+	}
+	return updated
+}
+
+func effectiveReadWriteMode(mountOpts, superOpts []string) string {
+	if slices.Contains(mountOpts, "ro") || slices.Contains(superOpts, "ro") {
+		return "ro"
+	}
+	if slices.Contains(mountOpts, "rw") && slices.Contains(superOpts, "rw") {
+		return "rw"
+	}
+	return ""
+}
+
 // getFileSystems returns supported filesystems from /proc/filesystems
-func getFileSystems() ([]string, error) {
-	filename := common.HostProc("filesystems")
+func getFileSystems(ctx context.Context) ([]string, error) {
+	filename := common.HostProcWithContext(ctx, "filesystems")
 	lines, err := common.ReadLines(filename)
 	if err != nil {
 		return nil, err
@@ -348,12 +501,12 @@ func getFileSystems() ([]string, error) {
 }
 
 func IOCountersWithContext(ctx context.Context, names ...string) (map[string]IOCountersStat, error) {
-	filename := common.HostProc("diskstats")
+	filename := common.HostProcWithContext(ctx, "diskstats")
 	lines, err := common.ReadLines(filename)
 	if err != nil {
 		return nil, err
 	}
-	ret := make(map[string]IOCountersStat, 0)
+	ret := make(map[string]IOCountersStat)
 	empty := IOCountersStat{}
 
 	// use only basename such as "/dev/sda1" to "sda1"
@@ -373,53 +526,53 @@ func IOCountersWithContext(ctx context.Context, names ...string) (map[string]IOC
 			continue
 		}
 
-		reads, err := strconv.ParseUint((fields[3]), 10, 64)
+		reads, err := strconv.ParseUint(fields[3], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		mergedReads, err := strconv.ParseUint((fields[4]), 10, 64)
+		mergedReads, err := strconv.ParseUint(fields[4], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		rbytes, err := strconv.ParseUint((fields[5]), 10, 64)
+		rbytes, err := strconv.ParseUint(fields[5], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		rtime, err := strconv.ParseUint((fields[6]), 10, 64)
+		rtime, err := strconv.ParseUint(fields[6], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		writes, err := strconv.ParseUint((fields[7]), 10, 64)
+		writes, err := strconv.ParseUint(fields[7], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		mergedWrites, err := strconv.ParseUint((fields[8]), 10, 64)
+		mergedWrites, err := strconv.ParseUint(fields[8], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		wbytes, err := strconv.ParseUint((fields[9]), 10, 64)
+		wbytes, err := strconv.ParseUint(fields[9], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		wtime, err := strconv.ParseUint((fields[10]), 10, 64)
+		wtime, err := strconv.ParseUint(fields[10], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		iopsInProgress, err := strconv.ParseUint((fields[11]), 10, 64)
+		iopsInProgress, err := strconv.ParseUint(fields[11], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		iotime, err := strconv.ParseUint((fields[12]), 10, 64)
+		iotime, err := strconv.ParseUint(fields[12], 10, 64)
 		if err != nil {
 			return ret, err
 		}
-		weightedIO, err := strconv.ParseUint((fields[13]), 10, 64)
+		weightedIO, err := strconv.ParseUint(fields[13], 10, 64)
 		if err != nil {
 			return ret, err
 		}
 		d := IOCountersStat{
-			ReadBytes:        rbytes * SectorSize,
-			WriteBytes:       wbytes * SectorSize,
+			ReadBytes:        rbytes * sectorSize,
+			WriteBytes:       wbytes * sectorSize,
 			ReadCount:        reads,
 			WriteCount:       writes,
 			MergedReadCount:  mergedReads,
@@ -435,70 +588,108 @@ func IOCountersWithContext(ctx context.Context, names ...string) (map[string]IOC
 		}
 		d.Name = name
 
-		d.SerialNumber = GetDiskSerialNumber(name)
-		d.Label = GetLabel(name)
+		// The major and minor numbers are the first two fields, so the udev
+		// lookups do not need to stat the device node, which a confined
+		// container may not be allowed to do (#2182). When getDeviceName
+		// renames an NVMe controller path (nvmeXcYnZ, #1878), the numbers
+		// belong to the hidden path, so look up the renamed device instead.
+		deviceName := getDeviceName(name)
+		major, majorErr := strconv.ParseUint(fields[0], 10, 32)
+		minor, minorErr := strconv.ParseUint(fields[1], 10, 32)
+		if majorErr == nil && minorErr == nil && deviceName == name {
+			d.SerialNumber, _ = serialNumberFromDevNum(ctx, uint32(major), uint32(minor))
+			d.Label, _ = labelFromDevNum(ctx, deviceName, uint32(major), uint32(minor))
+		} else {
+			// Names passed in can be full paths (/dev/sda) or just device names (sda).
+			// Since `name` here is already a basename, re-add the /dev path.
+			// This is not ideal, but we may break the API by changing how SerialNumberWithContext
+			// works.
+			d.SerialNumber, _ = SerialNumberWithContext(ctx, common.HostDevWithContext(ctx, deviceName))
+			d.Label, _ = LabelWithContext(ctx, deviceName)
+		}
 
 		ret[name] = d
 	}
 	return ret, nil
 }
 
-// GetDiskSerialNumber returns Serial Number of given device or empty string
-// on error. Name of device is expected, eg. /dev/sda
-func GetDiskSerialNumber(name string) string {
-	return GetDiskSerialNumberWithContext(context.Background(), name)
-}
-
-func GetDiskSerialNumberWithContext(ctx context.Context, name string) string {
-	var stat unix.Stat_t
-	err := unix.Stat(name, &stat)
-	if err != nil {
-		return ""
-	}
-	major := unix.Major(uint64(stat.Rdev))
-	minor := unix.Minor(uint64(stat.Rdev))
-
-	// Try to get the serial from udev data
-	udevDataPath := common.HostRun(fmt.Sprintf("udev/data/b%d:%d", major, minor))
-	if udevdata, err := ioutil.ReadFile(udevDataPath); err == nil {
-		scanner := bufio.NewScanner(bytes.NewReader(udevdata))
+func udevData(ctx context.Context, major, minor uint32, name string) (string, error) {
+	udevDataPath := common.HostRunWithContext(ctx, fmt.Sprintf("udev/data/b%d:%d", major, minor))
+	if f, err := os.Open(udevDataPath); err == nil {
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
-			values := strings.Split(scanner.Text(), "=")
-			if len(values) == 2 && values[0] == "E:ID_SERIAL" {
-				return values[1]
+			values := strings.SplitN(scanner.Text(), "=", 3)
+			if len(values) == 2 && values[0] == name {
+				return values[1], nil
 			}
 		}
+		return "", scanner.Err()
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return "", nil
+}
+
+func SerialNumberWithContext(ctx context.Context, name string) (string, error) {
+	var stat unix.Stat_t
+	if err := unix.Stat(name, &stat); err != nil {
+		return "", err
+	}
+	return serialNumberFromDevNum(ctx, unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)))
+}
+
+// serialNumberFromDevNum is SerialNumberWithContext for a device whose major
+// and minor numbers are already known, so the device node is not stat'ed.
+func serialNumberFromDevNum(ctx context.Context, major, minor uint32) (string, error) {
+	sserial, _ := udevData(ctx, major, minor, "E:ID_SERIAL")
+	if sserial != "" {
+		return sserial, nil
 	}
 
 	// Try to get the serial from sysfs, look at the disk device (minor 0) directly
 	// because if it is a partition it is not going to contain any device information
-	devicePath := common.HostSys(fmt.Sprintf("dev/block/%d:0/device", major))
-	model, _ := ioutil.ReadFile(filepath.Join(devicePath, "model"))
-	serial, _ := ioutil.ReadFile(filepath.Join(devicePath, "serial"))
+	devicePath := common.HostSysWithContext(ctx, fmt.Sprintf("dev/block/%d:0/device", major))
+	model, _ := os.ReadFile(filepath.Join(devicePath, "model"))
+	serial, _ := os.ReadFile(filepath.Join(devicePath, "serial"))
 	if len(model) > 0 && len(serial) > 0 {
-		return fmt.Sprintf("%s_%s", string(model), string(serial))
+		return fmt.Sprintf("%s_%s", string(model), string(serial)), nil
 	}
-	return ""
+	return "", nil
 }
 
-// GetLabel returns label of given device or empty string on error.
-// Name of device is expected, eg. /dev/sda
-// Supports label based on devicemapper name
-// See https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-block-dm
-func GetLabel(name string) string {
-	// Try label based on devicemapper name
-	dmname_filename := common.HostSys(fmt.Sprintf("block/%s/dm/name", name))
-
-	if !common.PathExists(dmname_filename) {
-		return ""
+func LabelWithContext(ctx context.Context, name string) (string, error) {
+	if label, ok := dmLabel(ctx, name); ok {
+		return label, nil
 	}
-
-	dmname, err := ioutil.ReadFile(dmname_filename)
-	if err != nil {
-		return ""
-	} else {
-		return strings.TrimSpace(string(dmname))
+	// Try udev data
+	var stat unix.Stat_t
+	if err := unix.Stat(common.HostDevWithContext(ctx, name), &stat); err != nil {
+		return "", err
 	}
+	return udevData(ctx, unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)), "E:ID_FS_LABEL")
+}
+
+// labelFromDevNum is LabelWithContext for a device whose major and minor
+// numbers are already known, so the device node is not stat'ed.
+func labelFromDevNum(ctx context.Context, name string, major, minor uint32) (string, error) {
+	if label, ok := dmLabel(ctx, name); ok {
+		return label, nil
+	}
+	return udevData(ctx, major, minor, "E:ID_FS_LABEL")
+}
+
+// dmLabel returns the device-mapper name of name, if it has one.
+func dmLabel(ctx context.Context, name string) (string, bool) {
+	dmnameFilename := common.HostSysWithContext(ctx, fmt.Sprintf("block/%s/dm/name", name))
+	// Could errors.Join errs with Go >= 1.20
+	if common.PathExists(dmnameFilename) {
+		dmname, err := os.ReadFile(dmnameFilename)
+		if err == nil {
+			return strings.TrimSpace(string(dmname)), true
+		}
+	}
+	return "", false
 }
 
 func getFsType(stat unix.Statfs_t) string {
@@ -508,4 +699,24 @@ func getFsType(stat unix.Statfs_t) string {
 		return ""
 	}
 	return ret
+}
+
+// getDeviceName normalizes NVMe device names by converting controller notation
+// from diskstats format (nvmeXcYnZ) to actual device format (nvmeXnZ).
+// This handles the discrepancy where /proc/diskstats reports nvmeXcYnZ
+// but actual device files exist as /dev/nvmeXnZ.
+func getDeviceName(name string) string {
+	if !strings.HasPrefix(name, "nvme") {
+		return name
+	}
+
+	// Look for controller notation pattern: nvmeXcYnZ
+	if cIdx := strings.Index(name, "c"); cIdx > 4 { // "nvme" is 4 chars
+		if nIdx := strings.Index(name[cIdx:], "n"); nIdx > 0 {
+			// Convert nvmeXcYnZ to nvmeXnZ by removing "cY" part
+			return name[:cIdx] + name[cIdx+nIdx:]
+		}
+	}
+
+	return name
 }

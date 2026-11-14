@@ -1,12 +1,10 @@
-// +build freebsd openbsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build freebsd || openbsd
 
 package common
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -25,24 +23,6 @@ func SysctlUint(mib string) (uint64, error) {
 		return uint64(t), nil
 	}
 	return 0, fmt.Errorf("unexpected size: %s, %d", mib, len(buf))
-}
-
-func DoSysctrl(mib string) ([]string, error) {
-	sysctl, err := exec.LookPath("sysctl")
-	if err != nil {
-		return []string{}, err
-	}
-	cmd := exec.Command(sysctl, "-n", mib)
-	cmd.Env = getSysctrlEnv(os.Environ())
-	out, err := cmd.Output()
-	if err != nil {
-		return []string{}, err
-	}
-	v := strings.Replace(string(out), "{ ", "", 1)
-	v = strings.Replace(string(v), " }", "", 1)
-	values := strings.Fields(string(v))
-
-	return values, nil
 }
 
 func CallSyscall(mib []int32) ([]byte, uint64, error) {

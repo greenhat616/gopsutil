@@ -1,0 +1,23 @@
+name: SBOM Generator
+
+on:
+  push:
+    branches: 
+      - master
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: advanced-security/sbom-generator-action@6fe43abf522b2e7a19bc769aec1e6c848614b517 # v0.0.2
+        id: sbom
+        env: 
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: 
+          path: ${{steps.sbom.outputs.fileName }}
+          name: "SBOM"

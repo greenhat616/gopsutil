@@ -1,39 +1,34 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package mem
 
 import (
-	"fmt"
+	"errors"
 	"runtime"
 	"testing"
 
-	"github.com/shirou/gopsutil/internal/common"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func skipIfNotImplementedErr(t *testing.T, err error) {
-	if err == common.ErrNotImplementedError {
-		t.Skip("not implemented")
-	}
-}
-
-func TestVirtual_memory(t *testing.T) {
-	if runtime.GOOS == "solaris" {
-		t.Skip("Only .Total is supported on Solaris")
+func TestVirtualMemory(t *testing.T) {
+	if runtime.GOOS == "solaris" || runtime.GOOS == "illumos" {
+		t.Skip("Only .Total .Available are supported on Solaris/illumos")
 	}
 
 	v, err := VirtualMemory()
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
+	require.NoError(t, err)
 	empty := &VirtualMemoryStat{}
-	if v == empty {
-		t.Errorf("error %v", v)
-	}
+	assert.NotSamef(t, v, empty, "error %v", v)
 	t.Log(v)
 
-	assert.True(t, v.Total > 0)
-	assert.True(t, v.Available > 0)
-	assert.True(t, v.Used > 0)
+	assert.Positive(t, v.Total)
+	assert.Positive(t, v.Available)
+	assert.Positive(t, v.Used)
 
 	total := v.Used + v.Free + v.Buffers + v.Cached
 	totalStr := "used + free + buffers + cached"
@@ -47,12 +42,15 @@ func TestVirtual_memory(t *testing.T) {
 	case "freebsd":
 		total = v.Used + v.Free + v.Cached + v.Inactive + v.Laundry
 		totalStr = "used + free + cached + inactive + laundry"
+	case "linux":
+		total = v.Available + v.Used
+		totalStr = "used + available"
 	}
-	assert.Equal(t, v.Total, total,
+	assert.Equalf(t, v.Total, total,
 		"Total should be computable (%v): %v", totalStr, v)
 
 	assert.True(t, runtime.GOOS == "windows" || v.Free > 0)
-	assert.True(t, runtime.GOOS == "windows" || v.Available > v.Free,
+	assert.Truef(t, runtime.GOOS == "windows" || v.Available > v.Free,
 		"Free should be a subset of Available: %v", v)
 
 	inDelta := assert.InDelta
@@ -64,16 +62,14 @@ func TestVirtual_memory(t *testing.T) {
 		"UsedPercent should be how many percent of Total is Used: %v", v)
 }
 
-func TestSwap_memory(t *testing.T) {
+func TestSwapMemory(t *testing.T) {
 	v, err := SwapMemory()
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
+	require.NoError(t, err)
 	empty := &SwapMemoryStat{}
-	if v == empty {
-		t.Errorf("error %v", v)
-	}
+	assert.NotSamef(t, v, empty, "error %v", v)
 
 	t.Log(v)
 }
@@ -86,10 +82,9 @@ func TestVirtualMemoryStat_String(t *testing.T) {
 		UsedPercent: 30.1,
 		Free:        40,
 	}
-	e := `{"total":10,"available":20,"used":30,"usedPercent":30.1,"free":40,"active":0,"inactive":0,"wired":0,"laundry":0,"buffers":0,"cached":0,"writeback":0,"dirty":0,"writebacktmp":0,"shared":0,"slab":0,"sreclaimable":0,"sunreclaim":0,"pagetables":0,"swapcached":0,"commitlimit":0,"committedas":0,"hightotal":0,"highfree":0,"lowtotal":0,"lowfree":0,"swaptotal":0,"swapfree":0,"mapped":0,"vmalloctotal":0,"vmallocused":0,"vmallocchunk":0,"hugepagestotal":0,"hugepagesfree":0,"hugepagesize":0}`
-	if e != fmt.Sprintf("%v", v) {
-		t.Errorf("VirtualMemoryStat string is invalid: %v", v)
-	}
+	t.Log(v)
+	e := `{"total":10,"available":20,"used":30,"usedPercent":30.1,"free":40,"active":0,"inactive":0,"wired":0,"laundry":0,"buffers":0,"cached":0,"writeBack":0,"dirty":0,"writeBackTmp":0,"shared":0,"slab":0,"sreclaimable":0,"sunreclaim":0,"pageTables":0,"swapCached":0,"commitLimit":0,"committedAS":0,"highTotal":0,"highFree":0,"lowTotal":0,"lowFree":0,"swapTotal":0,"swapFree":0,"mapped":0,"vmallocTotal":0,"vmallocUsed":0,"vmallocChunk":0,"hugePagesTotal":0,"hugePagesFree":0,"hugePagesRsvd":0,"hugePagesSurp":0,"hugePageSize":0,"anonHugePages":0}`
+	assert.JSONEqf(t, e, v.String(), "VirtualMemoryStat string is invalid: %v", v)
 }
 
 func TestSwapMemoryStat_String(t *testing.T) {
@@ -105,8 +100,28 @@ func TestSwapMemoryStat_String(t *testing.T) {
 		PgFault:     5,
 		PgMajFault:  6,
 	}
-	e := `{"total":10,"used":30,"free":40,"usedPercent":30.1,"sin":1,"sout":2,"pgin":3,"pgout":4,"pgfault":5,"pgmajfault":6}`
-	if e != fmt.Sprintf("%v", v) {
-		t.Errorf("SwapMemoryStat string is invalid: %v", v)
+	e := `{"total":10,"used":30,"free":40,"usedPercent":30.1,"sin":1,"sout":2,"pgIn":3,"pgOut":4,"pgFault":5,"pgMajFault":6}`
+	assert.JSONEqf(t, e, v.String(), "SwapMemoryStat string is invalid: %v", v)
+}
+
+func TestSwapDevices(t *testing.T) {
+	v, err := SwapDevices()
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
+	}
+	require.NoErrorf(t, err, "error calling SwapDevices: %v", err)
+
+	t.Logf("SwapDevices() -> %+v", v)
+
+	require.NotEmptyf(t, v, "no swap devices found. [this is expected if the host has swap disabled]")
+
+	for _, device := range v {
+		require.NotEmptyf(t, device.Name, "deviceName not set in %+v", device)
+		if device.FreeBytes == 0 {
+			t.Logf("[WARNING] free-bytes is zero in %+v. This might be expected", device)
+		}
+		if device.UsedBytes == 0 {
+			t.Logf("[WARNING] used-bytes is zero in %+v. This might be expected", device)
+		}
 	}
 }

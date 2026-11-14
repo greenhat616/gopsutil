@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -5,7 +6,7 @@
 // Hand Writing
 // - all pointer in ExternProc to uint64
 
-// +build ignore
+//go:build ignore
 
 /*
 Input to cgo -godefs.
@@ -52,6 +53,7 @@ package process
 #include <sys/sysctl.h>
 #include <sys/ucred.h>
 #include <sys/proc.h>
+#include <sys/proc_info.h>
 #include <sys/time.h>
 #include <sys/_types/_timeval.h>
 #include <sys/appleapiopts.h>
@@ -153,9 +155,23 @@ type Posix_cred C.struct_posix_cred
 
 type Label C.struct_label
 
-type AuditinfoAddr C.struct_auditinfo_addr
-type AuMask C.struct_au_mask
-type AuTidAddr C.struct_au_tid_addr
+type ProcTaskInfo C.struct_proc_taskinfo
+
+type vinfoStat C.struct_vinfo_stat
+
+type fsid C.struct_fsid
+
+type vnodeInfo C.struct_vnode_info
+
+type vnodeInfoPath C.struct_vnode_info_path
+
+type vnodePathInfo C.struct_proc_vnodepathinfo
+
+type (
+	AuditinfoAddr C.struct_auditinfo_addr
+	AuMask        C.struct_au_mask
+	AuTidAddr     C.struct_au_tid_addr
+)
 
 // TAILQ(ucred)
 type UcredQueue C.struct_ucred_queue

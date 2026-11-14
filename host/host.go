@@ -1,14 +1,18 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package host
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"runtime"
-	"time"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
+
+type Warnings = common.Warnings
 
 var invoke common.Invoker = common.Invoke{}
 
@@ -27,7 +31,7 @@ type InfoStat struct {
 	KernelArch           string `json:"kernelArch"`      // native cpu architecture queried at runtime, as returned by `uname -m` or empty string in case of error
 	VirtualizationSystem string `json:"virtualizationSystem"`
 	VirtualizationRole   string `json:"virtualizationRole"` // guest or host
-	HostID               string `json:"hostid"`             // ex: uuid
+	HostID               string `json:"hostId"`             // ex: uuid
 }
 
 type UserStat struct {
@@ -35,11 +39,6 @@ type UserStat struct {
 	Terminal string `json:"terminal"`
 	Host     string `json:"host"`
 	Started  int    `json:"started"`
-}
-
-type TemperatureStat struct {
-	SensorKey   string  `json:"sensorKey"`
-	Temperature float64 `json:"sensorTemperature"`
 }
 
 func (h InfoStat) String() string {
@@ -52,9 +51,11 @@ func (u UserStat) String() string {
 	return string(s)
 }
 
-func (t TemperatureStat) String() string {
-	s, _ := json.Marshal(t)
-	return string(s)
+var enableBootTimeCache bool
+
+// EnableBootTimeCache change cache behavior of BootTime. If true, cache BootTime value. Default is false.
+func EnableBootTimeCache(enable bool) {
+	enableBootTimeCache = enable
 }
 
 func Info() (*InfoStat, error) {
@@ -68,48 +69,48 @@ func InfoWithContext(ctx context.Context) (*InfoStat, error) {
 	}
 
 	ret.Hostname, err = os.Hostname()
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting hostname: %w", err)
 	}
 
 	ret.Platform, ret.PlatformFamily, ret.PlatformVersion, err = PlatformInformationWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting platform information: %w", err)
 	}
 
 	ret.KernelVersion, err = KernelVersionWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting kernel version: %w", err)
 	}
 
 	ret.KernelArch, err = KernelArch()
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting kernel architecture: %w", err)
 	}
 
 	ret.VirtualizationSystem, ret.VirtualizationRole, err = VirtualizationWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting virtualization information: %w", err)
 	}
 
 	ret.BootTime, err = BootTimeWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting boot time: %w", err)
 	}
 
 	ret.Uptime, err = UptimeWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting uptime: %w", err)
 	}
 
 	ret.Procs, err = numProcs(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting number of procs: %w", err)
 	}
 
 	ret.HostID, err = HostIDWithContext(ctx)
-	if err != nil && err != common.ErrNotImplementedError {
-		return nil, err
+	if err != nil && !errors.Is(err, common.ErrNotImplementedError) {
+		return nil, fmt.Errorf("getting host ID: %w", err)
 	}
 
 	return ret, nil
@@ -143,12 +144,4 @@ func Virtualization() (string, string, error) {
 
 func KernelVersion() (string, error) {
 	return KernelVersionWithContext(context.Background())
-}
-
-func SensorsTemperatures() ([]TemperatureStat, error) {
-	return SensorsTemperaturesWithContext(context.Background())
-}
-
-func timeSince(ts uint64) uint64 {
-	return uint64(time.Now().Unix()) - ts
 }

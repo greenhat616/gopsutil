@@ -1,4 +1,5 @@
-// +build ignore
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build ignore
 
 /*
 Input to cgo -godefs.

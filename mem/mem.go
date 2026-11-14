@@ -1,12 +1,21 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package mem
 
 import (
 	"encoding/json"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 var invoke common.Invoker = common.Invoke{}
+
+// WillBeDeletedOptInLinuxSwapVmstatUnits is a context key to get the fixed
+// units of SwapMemory on Linux: PgIn and PgOut in bytes, PgFault and
+// PgMajFault as counts. Without it, all four are the old values multiplied by
+// 4096. It has no effect on other platforms. The fixed units will be the
+// default in Feb. 2027, and this constant will be removed then.
+// See https://github.com/shirou/gopsutil/pull/2188
+const WillBeDeletedOptInLinuxSwapVmstatUnits = "optInLinuxSwapVmstatUnits"
 
 // Memory usage statistics. Total, Available and Used contain numbers of bytes
 // for human consumption.
@@ -47,35 +56,51 @@ type VirtualMemoryStat struct {
 	Laundry uint64 `json:"laundry"`
 
 	// Linux specific numbers
-	// https://www.centos.org/docs/5/html/5.1/Deployment_Guide/s2-proc-meminfo.html
+	// https://blogs.oracle.com/linux/understanding-linux-kernel-memory-statistics
 	// https://www.kernel.org/doc/Documentation/filesystems/proc.txt
 	// https://www.kernel.org/doc/Documentation/vm/overcommit-accounting
-	Buffers        uint64 `json:"buffers"`
-	Cached         uint64 `json:"cached"`
-	Writeback      uint64 `json:"writeback"`
-	Dirty          uint64 `json:"dirty"`
-	WritebackTmp   uint64 `json:"writebacktmp"`
-	Shared         uint64 `json:"shared"`
-	Slab           uint64 `json:"slab"`
-	SReclaimable   uint64 `json:"sreclaimable"`
-	SUnreclaim     uint64 `json:"sunreclaim"`
-	PageTables     uint64 `json:"pagetables"`
-	SwapCached     uint64 `json:"swapcached"`
-	CommitLimit    uint64 `json:"commitlimit"`
-	CommittedAS    uint64 `json:"committedas"`
-	HighTotal      uint64 `json:"hightotal"`
-	HighFree       uint64 `json:"highfree"`
-	LowTotal       uint64 `json:"lowtotal"`
-	LowFree        uint64 `json:"lowfree"`
-	SwapTotal      uint64 `json:"swaptotal"`
-	SwapFree       uint64 `json:"swapfree"`
+	// https://www.kernel.org/doc/Documentation/vm/transhuge.txt
+	//
+	Buffers uint64 `json:"buffers"`
+
+	// Cached is the page cache.
+	//
+	// On Linux this is "Cached" plus "SReclaimable" from /proc/meminfo, which
+	// is what free(1) and psutil report. Subtract Sreclaimable to get the raw
+	// "Cached" value.
+	Cached uint64 `json:"cached"`
+
+	WriteBack    uint64 `json:"writeBack"`
+	Dirty        uint64 `json:"dirty"`
+	WriteBackTmp uint64 `json:"writeBackTmp"`
+	Shared       uint64 `json:"shared"`
+	Slab         uint64 `json:"slab"`
+
+	// Sreclaimable is the reclaimable part of Slab. On Linux it is also
+	// included in Cached.
+	Sreclaimable uint64 `json:"sreclaimable"`
+
+	Sunreclaim     uint64 `json:"sunreclaim"`
+	PageTables     uint64 `json:"pageTables"`
+	SwapCached     uint64 `json:"swapCached"`
+	CommitLimit    uint64 `json:"commitLimit"`
+	CommittedAS    uint64 `json:"committedAS"`
+	HighTotal      uint64 `json:"highTotal"`
+	HighFree       uint64 `json:"highFree"`
+	LowTotal       uint64 `json:"lowTotal"`
+	LowFree        uint64 `json:"lowFree"`
+	SwapTotal      uint64 `json:"swapTotal"`
+	SwapFree       uint64 `json:"swapFree"`
 	Mapped         uint64 `json:"mapped"`
-	VMallocTotal   uint64 `json:"vmalloctotal"`
-	VMallocUsed    uint64 `json:"vmallocused"`
-	VMallocChunk   uint64 `json:"vmallocchunk"`
-	HugePagesTotal uint64 `json:"hugepagestotal"`
-	HugePagesFree  uint64 `json:"hugepagesfree"`
-	HugePageSize   uint64 `json:"hugepagesize"`
+	VmallocTotal   uint64 `json:"vmallocTotal"`
+	VmallocUsed    uint64 `json:"vmallocUsed"`
+	VmallocChunk   uint64 `json:"vmallocChunk"`
+	HugePagesTotal uint64 `json:"hugePagesTotal"`
+	HugePagesFree  uint64 `json:"hugePagesFree"`
+	HugePagesRsvd  uint64 `json:"hugePagesRsvd"`
+	HugePagesSurp  uint64 `json:"hugePagesSurp"`
+	HugePageSize   uint64 `json:"hugePageSize"`
+	AnonHugePages  uint64 `json:"anonHugePages"`
 }
 
 type SwapMemoryStat struct {
@@ -85,13 +110,13 @@ type SwapMemoryStat struct {
 	UsedPercent float64 `json:"usedPercent"`
 	Sin         uint64  `json:"sin"`
 	Sout        uint64  `json:"sout"`
-	PgIn        uint64  `json:"pgin"`
-	PgOut       uint64  `json:"pgout"`
-	PgFault     uint64  `json:"pgfault"`
+	PgIn        uint64  `json:"pgIn"`
+	PgOut       uint64  `json:"pgOut"`
+	PgFault     uint64  `json:"pgFault"`
 
 	// Linux specific numbers
 	// https://www.kernel.org/doc/Documentation/cgroup-v2.txt
-	PgMajFault  uint64  `json:"pgmajfault"`
+	PgMajFault uint64 `json:"pgMajFault"`
 }
 
 func (m VirtualMemoryStat) String() string {
@@ -100,6 +125,17 @@ func (m VirtualMemoryStat) String() string {
 }
 
 func (m SwapMemoryStat) String() string {
+	s, _ := json.Marshal(m)
+	return string(s)
+}
+
+type SwapDevice struct {
+	Name      string `json:"name"`
+	UsedBytes uint64 `json:"usedBytes"`
+	FreeBytes uint64 `json:"freeBytes"`
+}
+
+func (m SwapDevice) String() string {
 	s, _ := json.Marshal(m)
 	return string(s)
 }

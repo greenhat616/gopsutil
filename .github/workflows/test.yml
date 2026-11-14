@@ -1,91 +1,85 @@
-on: [push, pull_request]
 name: Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  test_v3_module:
+  go-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.value }}
+    steps:
+      - id: versions
+        run: |
+          versions=$(curl -s 'https://go.dev/dl/?mode=json' | jq -c 'map(.version[2:])')
+          echo "value=${versions}"  >> $GITHUB_OUTPUT
+  test:
+    needs: go-versions
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [1.13.x, 1.14.x, 1.15.x]
-        os: [ubuntu-18.04, ubuntu-16.04, windows-2019, windows-2016, macOS-10.14, macos-11.0]
+        go-version: ${{fromJson(needs.go-versions.outputs.versions)}}
+        os:
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - macos-26
+          - macos-15
+          - macos-15-intel
+          - windows-2025
+          - windows-2022
+        # Empty is the runner's native arch. 386 is windows-only here:
+        # process_windows.go reads an NT UNICODE_STRING whose header width
+        # follows the calling process, and process_windows_32bit.go is built
+        # only for 386/arm. lint.yml builds windows/386 but never runs a
+        # test, so neither has ever been executed anywhere. A 64-bit runner
+        # runs 386 test binaries directly under WOW64, so this needs no
+        # separate machine. darwin has no 386 port; any non-windows os added
+        # above needs a matching exclude below.
+        GOARCH:
+          - ""
+          - "386"
+        exclude:
+          - {os: ubuntu-24.04, GOARCH: "386"}
+          - {os: ubuntu-22.04, GOARCH: "386"}
+          - {os: macos-26, GOARCH: "386"}
+          - {os: macos-15, GOARCH: "386"}
+          - {os: macos-15-intel, GOARCH: "386"}
+    # Spelled out so the native jobs keep the names they had before GOARCH
+    # was added to the matrix, instead of gaining an empty trailing field.
+    name: test (${{ matrix.go-version }}, ${{ matrix.os }}${{ matrix.GOARCH && format(', {0}', matrix.GOARCH) || '' }})
     runs-on: ${{ matrix.os }}
     steps:
-    - name: Install Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go-version }}
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: Test
-      run: |
-        cd ./v3/
-        go test ./...
-
-  test_v3_gopath:
-    env:
-      GOPATH: ${{ github.workspace }}
-      GO111MODULE: off
-    strategy:
-      matrix:
-        go-version: [1.13.x, 1.14.x, 1.15.x]
-        os: [ubuntu-18.04, ubuntu-16.04, windows-2019, windows-2016, macOS-10.14, macos-11.0]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - name: Install Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go-version }}
-    - name: Checkout code
-      uses: actions/checkout@v2
-      with:
-        path: ${{ github.workspace }}/src/github.com/shirou/gopsutil
-    - name: Get dependencies
-      run: |
-        go get -t github.com/shirou/gopsutil/v3/...
-    - name: Test
-      run: |
-        go test github.com/shirou/gopsutil/v3/...
-
-  test_v2_gopath:
-    env:
-      GOPATH: ${{ github.workspace }}
-      GO111MODULE: off
-    strategy:
-      matrix:
-        go-version: [1.13.x, 1.14.x, 1.15.x]
-        os: [ubuntu-18.04, ubuntu-16.04, windows-2019, windows-2016, macOS-10.14, macos-11.0]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - name: Install Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go-version }}
-    - name: Checkout code
-      uses: actions/checkout@v2
-      with:
-        path: ${{ github.workspace }}/src/github.com/shirou/gopsutil
-    - name: Get dependencies
-      if: runner.os == 'Windows'
-      run: |
-        go get -d -u github.com/golang/dep
-        cd $Env:GOPATH/src/github.com/golang/dep
-        git checkout v0.5.4
-        go install -ldflags="-X main.version=v0.5.4" ./cmd/dep
-        echo "$Env:GOPATH/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        cd $Env:GOPATH/src/github.com/shirou/gopsutil
-        dep ensure
-        # exclude v3 from being run with ./...
-        try { rm -ErrorAction:Stop -Recurse -Force $Env:GOPATH/src/github.com/shirou/gopsutil/v3 } catch [System.Management.Automation.ItemNotFoundException] {}
-    - name: Get dependencies
-      if: runner.os != 'Windows'
-      run: |
-        if ! command -v dep &>/dev/null; then
-          mkdir -p $GOPATH/bin
-          curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
-          echo "PATH=$GOPATH/bin:$PATH" >> $GITHUB_PATH
-        fi
-        cd $GOPATH/src/github.com/shirou/gopsutil
-        dep ensure
-        # exclude v3 from being run with ./...
-        rm -rf $GOPATH/src/github.com/shirou/gopsutil/v3
-    - name: Test
-      run: |
-        go test github.com/shirou/gopsutil/...
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go-version }}
+      # psutil enables the *_Against_Psutil comparison tests; they skip
+      # when it is missing, so both steps are best-effort.
+      - name: Install Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.x"
+        continue-on-error: true
+      - name: Install psutil
+        # Pinned like the SHA-pinned actions above: the *_Against_Psutil
+        # tests are verified against this psutil version; bump deliberately
+        # after re-checking the comparisons.
+        run: python -m pip install psutil==7.2.2
+        continue-on-error: true
+      - name: Test
+        env:
+          GOARCH: ${{ matrix.GOARCH }}
+        run: |
+          go test -coverprofile='coverage.out' -covermode=atomic ./...

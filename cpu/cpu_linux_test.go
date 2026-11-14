@@ -1,30 +1,93 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package cpu
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func TestTimesEmpty(t *testing.T) {
-	orig := os.Getenv("HOST_PROC")
-	os.Setenv("HOST_PROC", "testdata/linux/times_empty")
-	_, err := Times(true)
-	if err != nil {
-		t.Error("Times(true) failed")
+// LoongArch emits the capitalized key in arch/loongarch/kernel/proc.c.
+func TestCPUInfoFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, value, want string
+	}{
+		{"loongarch", "CPU Family", "Loongson-64bit", "Loongson-64bit"},
+		{"x86", "cpu family", "6", "6"},
+		{"riscv", "marchid", "0x8000000000000007", "0x8000000000000007"},
+		{"unrecognized", "CPU family", "ignored", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOST_PROC", root)
+			t.Setenv("HOST_SYS", root)
+			// Include multiple processors and neighboring LoongArch fields to exercise
+			// record finalization and preserve model, frequency and feature parsing.
+			var data strings.Builder
+			data.WriteString("system type : Generic Loongson64\n\n")
+			for cpu := 0; cpu < 2; cpu++ {
+				data.WriteString("processor : " + strconv.Itoa(cpu) + "\n" + tc.key + " : " + tc.value + "\nModel Name : Loongson-3A6000\nCPU MHz : 2500.00\nFeatures : cpucfg lam fpu\n\n")
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(root, "cpuinfo"), []byte(data.String()), 0o600))
+			info, err := InfoWithContext(t.Context())
+			require.NoError(t, err)
+			require.Len(t, info, 2)
+			for cpu, stat := range info {
+				assert.Equal(t, int32(cpu), stat.CPU)
+				assert.Equal(t, tc.want, stat.Family)
+				assert.Equal(t, "Loongson-3A6000", stat.ModelName)
+				assert.InDelta(t, 2500.0, stat.Mhz, 0.001)
+				assert.Equal(t, []string{"cpucfg", "lam", "fpu"}, stat.Flags)
+			}
+		})
 	}
-	_, err = Times(false)
-	if err != nil {
-		t.Error("Times(false) failed")
-	}
-	os.Setenv("HOST_PROC", orig)
 }
 
-func TestCPUparseStatLine_424(t *testing.T) {
-	orig := os.Getenv("HOST_PROC")
-	os.Setenv("HOST_PROC", "testdata/linux/424/proc")
+func TestCPUInfoFrequencyFallback_1776(t *testing.T) {
+	for _, key := range []string{"cpu MHz", "CPU MHz", "clock", "cpu MHz dynamic"} {
+		t.Run(key, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOST_PROC", root)
+			t.Setenv("HOST_SYS", root)
+			data := "processor : 0\n" + key + " : 2600.500\n"
+			require.NoError(t, os.WriteFile(filepath.Join(root, "cpuinfo"), []byte(data), 0o600))
+			info, err := Info()
+			require.NoError(t, err)
+			require.Len(t, info, 1)
+			assert.InDelta(t, 2600.5, info[0].Mhz, 0.001)
+
+			// The sysfs maximum still takes precedence over any cpuinfo spelling.
+			cpufreq := filepath.Join(root, "devices", "system", "cpu", "cpu0", "cpufreq")
+			require.NoError(t, os.MkdirAll(cpufreq, 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(cpufreq, "cpuinfo_max_freq"), []byte("3500000\n"), 0o600))
+			info, err = Info()
+			require.NoError(t, err)
+			require.Len(t, info, 1)
+			assert.InDelta(t, 3500.0, info[0].Mhz, 0.001)
+		})
+	}
+}
+
+func TestTimesEmpty(t *testing.T) {
+	t.Setenv("HOST_PROC", "testdata/linux/times_empty")
+	_, err := Times(true)
+	require.NoErrorf(t, err, "Times(true) failed")
+	_, err = Times(false)
+	assert.NoErrorf(t, err, "Times(false) failed")
+}
+
+func TestParseStatLine_424(t *testing.T) {
+	t.Setenv("HOST_PROC", "testdata/linux/424/proc")
 	{
 		l, err := Times(true)
 		if err != nil || len(l) == 0 {
@@ -39,21 +102,21 @@ func TestCPUparseStatLine_424(t *testing.T) {
 		}
 		t.Logf("Times(false): %#v", l)
 	}
-	os.Setenv("HOST_PROC", orig)
 }
 
-func TestCPUCountsAgainstLscpu(t *testing.T) {
-	lscpu, err := exec.LookPath("lscpu")
-	if err != nil {
-		t.Skip("no lscpu to compare with")
-	}
-	cmd := exec.Command(lscpu)
+func TestCountsAgainstLscpu(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "lscpu")
 	cmd.Env = []string{"LC_ALL=C"}
 	out, err := cmd.Output()
 	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			t.Skip("no lscpu to compare with")
+		}
 		t.Errorf("error executing lscpu: %v", err)
 	}
-	var threadsPerCore, coresPerSocket, sockets int
+	var threadsPerCore, coresPerSocket, sockets, clusters, books, drawers int
+	books = 1
+	drawers = 1
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
 		fields := strings.Split(line, ":")
@@ -63,46 +126,56 @@ func TestCPUCountsAgainstLscpu(t *testing.T) {
 		switch fields[0] {
 		case "Thread(s) per core":
 			threadsPerCore, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
-		case "Core(s) per socket":
+		case "Core(s) per socket", "Core(s) per cluster":
 			coresPerSocket, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
-		case "Socket(s)":
+		case "Socket(s)", "Socket(s) per book":
 			sockets, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
+		case "Cluster(s)":
+			clusters, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
+		case "Book(s) per drawer":
+			books, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
+		case "Drawer(s)":
+			drawers, _ = strconv.Atoi(strings.TrimSpace(fields[1]))
 		}
+	}
+	if sockets == 0 {
+		sockets = clusters
 	}
 	if threadsPerCore == 0 || coresPerSocket == 0 || sockets == 0 {
 		t.Errorf("missing info from lscpu: threadsPerCore=%d coresPerSocket=%d sockets=%d", threadsPerCore, coresPerSocket, sockets)
 	}
-	expectedPhysical := coresPerSocket * sockets
+	expectedPhysical := coresPerSocket * sockets * books * drawers
 	expectedLogical := expectedPhysical * threadsPerCore
 	physical, err := Counts(false)
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
+	require.NoError(t, err)
 	logical, err := Counts(true)
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
-	if expectedPhysical != physical {
-		t.Errorf("expected %v, got %v", expectedPhysical, physical)
-	}
-	if expectedLogical != logical {
-		t.Errorf("expected %v, got %v", expectedLogical, logical)
-	}
+	require.NoError(t, err)
+	assert.Equalf(t, expectedPhysical, physical, "expected %v, got %v", expectedPhysical, physical)
+	assert.Equalf(t, expectedLogical, logical, "expected %v, got %v", expectedLogical, logical)
 }
 
-func TestCPUCountsLogicalAndroid_1037(t *testing.T) { // https://github.com/shirou/gopsutil/issues/1037
-	orig := os.Getenv("HOST_PROC")
-	os.Setenv("HOST_PROC", "testdata/linux/1037/proc")
-	defer os.Setenv("HOST_PROC", orig)
+func TestCountsLogicalAndroid_1037(t *testing.T) { // https://github.com/shirou/gopsutil/issues/1037
+	t.Setenv("HOST_PROC", "testdata/linux/1037/proc")
 
 	count, err := Counts(true)
-	if err != nil {
-		t.Errorf("error %v", err)
-	}
+	require.NoError(t, err)
 	expected := 8
-	if count != expected {
-		t.Errorf("expected %v, got %v", expected, count)
-	}
+	assert.Equalf(t, expected, count, "expected %v, got %v", expected, count)
+}
+
+func TestCPUInfoModelNameWithColon_1958(t *testing.T) { // https://github.com/shirou/gopsutil/issues/1958
+	t.Setenv("HOST_PROC", "testdata/linux/1958/proc")
+
+	info, err := Info()
+	require.NoError(t, err)
+	require.Len(t, info, 1)
+
+	expected := "Hygon C86-4G (OPN:5435)"
+	assert.Equalf(t, expected, info[0].ModelName, "expected %v, got %v", expected, info[0].ModelName)
 }

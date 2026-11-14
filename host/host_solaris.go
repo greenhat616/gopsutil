@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build solaris
+
 package host
 
 import (
@@ -5,14 +8,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 func HostIDWithContext(ctx context.Context) (string, error) {
@@ -23,23 +26,19 @@ func HostIDWithContext(ctx context.Context) (string, error) {
 
 	if platform == "SmartOS" {
 		// If everything works, use the current zone ID as the HostID if present.
-		zonename, err := exec.LookPath("zonename")
+		out, err := invoke.CommandWithContext(ctx, "zonename")
 		if err == nil {
-			out, err := invoke.CommandWithContext(ctx, zonename)
-			if err == nil {
-				sc := bufio.NewScanner(bytes.NewReader(out))
-				for sc.Scan() {
-					line := sc.Text()
+			sc := bufio.NewScanner(bytes.NewReader(out))
+			for sc.Scan() {
+				line := sc.Text()
 
-					// If we're in the global zone, rely on the hostname.
-					if line == "global" {
-						hostname, err := os.Hostname()
-						if err == nil {
-							return hostname, nil
-						}
-					} else {
-						return strings.TrimSpace(line), nil
-					}
+				// If we're in the global zone, rely on the hostname.
+				if line != "global" {
+					return strings.TrimSpace(line), nil
+				}
+				hostname, err := os.Hostname()
+				if err == nil {
+					return hostname, nil
 				}
 			}
 		}
@@ -48,15 +47,12 @@ func HostIDWithContext(ctx context.Context) (string, error) {
 	// If HostID is still unknown, use hostid(1), which can lie to callers but at
 	// this point there are no hardware facilities available.  This behavior
 	// matches that of other supported OSes.
-	hostID, err := exec.LookPath("hostid")
+	out, err := invoke.CommandWithContext(ctx, "hostid")
 	if err == nil {
-		out, err := invoke.CommandWithContext(ctx, hostID)
-		if err == nil {
-			sc := bufio.NewScanner(bytes.NewReader(out))
-			for sc.Scan() {
-				line := sc.Text()
-				return strings.TrimSpace(line), nil
-			}
+		sc := bufio.NewScanner(bytes.NewReader(out))
+		for sc.Scan() {
+			line := sc.Text()
+			return strings.TrimSpace(line), nil
 		}
 	}
 
@@ -64,23 +60,18 @@ func HostIDWithContext(ctx context.Context) (string, error) {
 }
 
 // Count number of processes based on the number of entries in /proc
-func numProcs(ctx context.Context) (uint64, error) {
-	dirs, err := ioutil.ReadDir("/proc")
+func numProcs(_ context.Context) (uint64, error) {
+	dirs, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err
 	}
 	return uint64(len(dirs)), nil
 }
 
-var kstatMatch = regexp.MustCompile(`([^\s]+)[\s]+([^\s]*)`)
+var kstatMatch = regexp.MustCompile(`(\S+)\s+(\S*)`)
 
 func BootTimeWithContext(ctx context.Context) (uint64, error) {
-	kstat, err := exec.LookPath("kstat")
-	if err != nil {
-		return 0, err
-	}
-
-	out, err := invoke.CommandWithContext(ctx, kstat, "-p", "unix:0:system_misc:boot_time")
+	out, err := invoke.CommandWithContext(ctx, "kstat", "-p", "unix:0:system_misc:boot_time")
 	if err != nil {
 		return 0, err
 	}
@@ -94,28 +85,24 @@ func BootTimeWithContext(ctx context.Context) (uint64, error) {
 }
 
 func UptimeWithContext(ctx context.Context) (uint64, error) {
-	bootTime, err := BootTime()
+	bootTime, err := BootTimeWithContext(ctx)
 	if err != nil {
 		return 0, err
 	}
-	return timeSince(bootTime), nil
+	return common.TimeSince(bootTime), nil
 }
 
-func UsersWithContext(ctx context.Context) ([]UserStat, error) {
+func UsersWithContext(_ context.Context) ([]UserStat, error) {
 	return []UserStat{}, common.ErrNotImplementedError
 }
 
-func SensorsTemperaturesWithContext(ctx context.Context) ([]TemperatureStat, error) {
-	return []TemperatureStat{}, common.ErrNotImplementedError
-}
-
-func VirtualizationWithContext(ctx context.Context) (string, string, error) {
+func VirtualizationWithContext(_ context.Context) (string, string, error) {
 	return "", "", common.ErrNotImplementedError
 }
 
 // Find distribution name from /etc/release
 func parseReleaseFile() (string, error) {
-	b, err := ioutil.ReadFile("/etc/release")
+	b, err := os.ReadFile("/etc/release")
 	if err != nil {
 		return "", err
 	}
@@ -145,37 +132,30 @@ func parseReleaseFile() (string, error) {
 }
 
 // parseUnameOutput returns platformFamily, kernelVersion and platformVersion
-func parseUnameOutput(ctx context.Context) (string, string, string, error) {
-	uname, err := exec.LookPath("uname")
-	if err != nil {
+func parseUnameOutput() (string, string, string, error) {
+	var utsname unix.Utsname
+	if err := unix.Uname(&utsname); err != nil {
 		return "", "", "", err
 	}
 
-	out, err := invoke.CommandWithContext(ctx, uname, "-srv")
-	if err != nil {
-		return "", "", "", err
-	}
-
-	fields := strings.Fields(string(out))
-	if len(fields) < 3 {
-		return "", "", "", fmt.Errorf("malformed `uname` output")
-	}
-
-	return fields[0], fields[1], fields[2], nil
+	return unix.ByteSliceToString(utsname.Sysname[:]),
+		unix.ByteSliceToString(utsname.Release[:]),
+		unix.ByteSliceToString(utsname.Version[:]),
+		nil
 }
 
-func KernelVersionWithContext(ctx context.Context) (string, error) {
-	_, kernelVersion, _, err := parseUnameOutput(ctx)
+func KernelVersionWithContext(_ context.Context) (string, error) {
+	_, kernelVersion, _, err := parseUnameOutput()
 	return kernelVersion, err
 }
 
-func PlatformInformationWithContext(ctx context.Context) (string, string, string, error) {
+func PlatformInformationWithContext(_ context.Context) (string, string, string, error) {
 	platform, err := parseReleaseFile()
 	if err != nil {
 		return "", "", "", err
 	}
 
-	platformFamily, _, platformVersion, err := parseUnameOutput(ctx)
+	platformFamily, _, platformVersion, err := parseUnameOutput()
 	if err != nil {
 		return "", "", "", err
 	}

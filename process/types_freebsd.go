@@ -1,4 +1,5 @@
-// +build ignore
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build ignore
 
 // We still need editing by hands.
 // go tool cgo -godefs types_freebsd.go | sed 's/\*int64/int64/' | sed 's/\*byte/int64/'  > process_freebsd_amd64.go
@@ -11,11 +12,11 @@ Input to cgo -godefs.
 // +godefs map struct_proc int64 /* proc */
 // +godefs map struct_user int64 /* user */
 // +godefs map struct_vnode int64 /* vnode */
-// +godefs map struct_vnode int64 /* vnode */
 // +godefs map struct_filedesc int64 /* filedesc */
 // +godefs map struct_vmspace int64 /* vmspace */
 // +godefs map struct_pcb int64 /* pcb */
 // +godefs map struct_thread int64 /* thread */
+// +godefs map struct_pwddesc int64 /* pwddesc, not accurate */
 // +godefs map struct___sigset [16]byte /* sigset */
 
 package process
@@ -41,6 +42,7 @@ const (
 	KernProcProc     = 8  // only return procs
 	KernProcPathname = 12 // path to executable
 	KernProcArgs     = 7  // get/set arguments/proctitle
+	KernProcCwd      = 42 /* process current working directory */
 )
 
 const (
@@ -54,6 +56,7 @@ const (
 const (
 	sizeOfKinfoVmentry = C.sizeof_struct_kinfo_vmentry
 	sizeOfKinfoProc    = C.sizeof_struct_kinfo_proc
+	sizeOfKinfoFile    = C.sizeof_struct_kinfo_file
 )
 
 // from sys/proc.h
@@ -93,3 +96,7 @@ type KinfoProc C.struct_kinfo_proc
 type Priority C.struct_priority
 
 type KinfoVmentry C.struct_kinfo_vmentry
+
+type kinfoFile C.struct_kinfo_file
+
+type capRights C.struct_cap_rights

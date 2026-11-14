@@ -1,13 +1,19 @@
-// +build race
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build race
 
 package process
 
 import (
+	"errors"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func Test_Process_Ppid_Race(t *testing.T) {
+func TestPpid_Race(t *testing.T) {
 	wg := sync.WaitGroup{}
 	testCount := 10
 	p := testGetProcess()
@@ -16,10 +22,12 @@ func Test_Process_Ppid_Race(t *testing.T) {
 		go func(j int) {
 			ppid, err := p.Ppid()
 			wg.Done()
-			skipIfNotImplementedErr(t, err)
-			if err != nil {
-				t.Errorf("Ppid() failed, %v", err)
+
+			if errors.Is(err, common.ErrNotImplementedError) {
+				t.Skip("not implemented")
 			}
+
+			require.NoError(t, err, "Ppid() failed, %v", err)
 
 			if j == 9 {
 				t.Logf("Ppid(): %d", ppid)

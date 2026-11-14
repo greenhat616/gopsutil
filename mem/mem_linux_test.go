@@ -1,17 +1,27 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build linux
+
 package mem
 
 import (
-	"os"
+	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func TestVirtualMemoryEx(t *testing.T) {
-	v, err := VirtualMemoryEx()
-	if err != nil {
-		t.Error(err)
-	}
+func TestExVirtualMemory(t *testing.T) {
+	ex := NewExLinux()
+
+	v, err := ex.VirtualMemory()
+	require.NoError(t, err)
 
 	t.Log(v)
 }
@@ -19,99 +29,255 @@ func TestVirtualMemoryEx(t *testing.T) {
 var virtualMemoryTests = []struct {
 	mockedRootFS string
 	stat         *VirtualMemoryStat
+	exStat       *ExVirtualMemory
 }{
-	{"intelcorei5", &VirtualMemoryStat{
-		Total:          16502300672,
-		Available:      11495358464,
-		Used:           3437277184,
-		UsedPercent:    20.82907863769651,
-		Free:           8783491072,
-		Active:         4347392000,
-		Inactive:       2938834944,
-		Wired:          0,
-		Laundry:        0,
-		Buffers:        212496384,
-		Cached:         4069036032,
-		Writeback:      0,
-		Dirty:          176128,
-		WritebackTmp:   0,
-		Shared:         1222402048,
-		Slab:           253771776,
-		SReclaimable:   186470400,
-		SUnreclaim:     67301376,
-		PageTables:     65241088,
-		SwapCached:     0,
-		CommitLimit:    16509730816,
-		CommittedAS:    12360818688,
-		HighTotal:      0,
-		HighFree:       0,
-		LowTotal:       0,
-		LowFree:        0,
-		SwapTotal:      8258580480,
-		SwapFree:       8258580480,
-		Mapped:         1172627456,
-		VMallocTotal:   35184372087808,
-		VMallocUsed:    0,
-		VMallocChunk:   0,
-		HugePagesTotal: 0,
-		HugePagesFree:  0,
-		HugePageSize:   2097152},
+	{
+		"intelcorei5", &VirtualMemoryStat{
+			Total:          16502300672,
+			Available:      11495358464,
+			Used:           5006942208,
+			UsedPercent:    30.340873721295385,
+			Free:           8783491072,
+			Active:         4347392000,
+			Inactive:       2938834944,
+			Wired:          0,
+			Laundry:        0,
+			Buffers:        212496384,
+			Cached:         4069036032,
+			WriteBack:      0,
+			Dirty:          176128,
+			WriteBackTmp:   0,
+			Shared:         1222402048,
+			Slab:           253771776,
+			Sreclaimable:   186470400,
+			Sunreclaim:     67301376,
+			PageTables:     65241088,
+			SwapCached:     0,
+			CommitLimit:    16509730816,
+			CommittedAS:    12360818688,
+			HighTotal:      0,
+			HighFree:       0,
+			LowTotal:       0,
+			LowFree:        0,
+			SwapTotal:      8258580480,
+			SwapFree:       8258580480,
+			Mapped:         1172627456,
+			VmallocTotal:   35184372087808,
+			VmallocUsed:    0,
+			VmallocChunk:   0,
+			HugePagesTotal: 0,
+			HugePagesFree:  0,
+			HugePagesRsvd:  0,
+			HugePagesSurp:  0,
+			HugePageSize:   2097152,
+		},
+		&ExVirtualMemory{
+			ActiveFile:   1121992 * 1024,
+			InactiveFile: 1683344 * 1024,
+			ActiveAnon:   3123508 * 1024,
+			InactiveAnon: 1186612 * 1024,
+			Unevictable:  32 * 1024,
+			Percpu:       19136 * 1024,
+			KernelStack:  14224 * 1024,
+		},
 	},
-	{"issue1002", &VirtualMemoryStat{
-		Total:          260579328,
-		Available:      215199744,
-		Used:           34328576,
-		UsedPercent:    13.173944481121694,
-		Free:           124506112,
-		Active:         108785664,
-		Inactive:       8581120,
-		Wired:          0,
-		Laundry:        0,
-		Buffers:        4915200,
-		Cached:         96829440,
-		Writeback:      0,
-		Dirty:          0,
-		WritebackTmp:   0,
-		Shared:         0,
-		Slab:           9293824,
-		SReclaimable:   2764800,
-		SUnreclaim:     6529024,
-		PageTables:     405504,
-		SwapCached:     0,
-		CommitLimit:    130289664,
-		CommittedAS:    25567232,
-		HighTotal:      134217728,
-		HighFree:       67784704,
-		LowTotal:       126361600,
-		LowFree:        56721408,
-		SwapTotal:      0,
-		SwapFree:       0,
-		Mapped:         38793216,
-		VMallocTotal:   1996488704,
-		VMallocUsed:    0,
-		VMallocChunk:   0,
-		HugePagesTotal: 0,
-		HugePagesFree:  0,
-		HugePageSize:   0},
+	{
+		"issue1002", &VirtualMemoryStat{
+			Total:          260579328,
+			Available:      215199744,
+			Used:           45379584,
+			UsedPercent:    17.414882580401773,
+			Free:           124506112,
+			Active:         108785664,
+			Inactive:       8581120,
+			Wired:          0,
+			Laundry:        0,
+			Buffers:        4915200,
+			Cached:         96829440,
+			WriteBack:      0,
+			Dirty:          0,
+			WriteBackTmp:   0,
+			Shared:         0,
+			Slab:           9293824,
+			Sreclaimable:   2764800,
+			Sunreclaim:     6529024,
+			PageTables:     405504,
+			SwapCached:     0,
+			CommitLimit:    130289664,
+			CommittedAS:    25567232,
+			HighTotal:      134217728,
+			HighFree:       67784704,
+			LowTotal:       126361600,
+			LowFree:        56721408,
+			SwapTotal:      0,
+			SwapFree:       0,
+			Mapped:         38793216,
+			VmallocTotal:   1996488704,
+			VmallocUsed:    0,
+			VmallocChunk:   0,
+			HugePagesTotal: 0,
+			HugePagesFree:  0,
+			HugePagesRsvd:  0,
+			HugePagesSurp:  0,
+			HugePageSize:   0,
+		},
+		&ExVirtualMemory{
+			ActiveFile:   88280 * 1024,
+			InactiveFile: 8380 * 1024,
+			ActiveAnon:   17956 * 1024,
+			InactiveAnon: 0,
+			Unevictable:  0,
+			Percpu:       0,
+			KernelStack:  624 * 1024,
+		},
+	},
+	{
+		"anonhugepages", &VirtualMemoryStat{
+			Total:         260799420 * 1024,
+			Available:     127880216 * 1024,
+			Free:          119443248 * 1024,
+			AnonHugePages: 50409472 * 1024,
+			Used:          136109264896,
+			UsedPercent:   50.96606579876596,
+		},
+		&ExVirtualMemory{
+			ActiveFile:   0,
+			InactiveFile: 0,
+			ActiveAnon:   0,
+			InactiveAnon: 0,
+			Unevictable:  0,
+			Percpu:       0,
+		},
 	},
 }
 
 func TestVirtualMemoryLinux(t *testing.T) {
-	origProc := os.Getenv("HOST_PROC")
-	defer os.Setenv("HOST_PROC", origProc)
-
 	for _, tt := range virtualMemoryTests {
 		t.Run(tt.mockedRootFS, func(t *testing.T) {
-			os.Setenv("HOST_PROC", filepath.Join("testdata/linux/virtualmemory/", tt.mockedRootFS, "proc"))
+			t.Setenv("HOST_PROC", filepath.Join("testdata", "linux", "virtualmemory", tt.mockedRootFS, "proc"))
 
 			stat, err := VirtualMemory()
-			skipIfNotImplementedErr(t, err)
-			if err != nil {
-				t.Errorf("error %v", err)
+			if errors.Is(err, common.ErrNotImplementedError) {
+				t.Skip("not implemented")
 			}
-			if !reflect.DeepEqual(stat, tt.stat) {
-				t.Errorf("got: %+v\nwant: %+v", stat, tt.stat)
-			}
+			require.NoError(t, err)
+			assert.Truef(t, reflect.DeepEqual(stat, tt.stat), "got: %+v\nwant: %+v", stat, tt.stat)
 		})
 	}
+}
+
+func TestExVirtualMemoryLinux(t *testing.T) {
+	for _, tt := range virtualMemoryTests {
+		t.Run(tt.mockedRootFS, func(t *testing.T) {
+			t.Setenv("HOST_PROC", filepath.Join("testdata", "linux", "virtualmemory", tt.mockedRootFS, "proc"))
+
+			ex := NewExLinux()
+			exStat, err := ex.VirtualMemory()
+			if errors.Is(err, common.ErrNotImplementedError) {
+				t.Skip("not implemented")
+			}
+			require.NoError(t, err)
+			assert.Truef(t, reflect.DeepEqual(exStat, tt.exStat), "got: %+v\nwant: %+v", exStat, tt.exStat)
+		})
+	}
+}
+
+func TestSwapMemoryVmstatLinux(t *testing.T) {
+	t.Setenv("HOST_PROC", filepath.Join("testdata", "linux", "swapmemory", "proc"))
+
+	withOptIn := func(v any) context.Context {
+		return context.WithValue(context.Background(), WillBeDeletedOptInLinuxSwapVmstatUnits, v) //nolint:revive,staticcheck // the key is an untyped string by design
+	}
+
+	oldUnits := &SwapMemoryStat{
+		Sin:        136604654 * 4 * 1024,
+		Sout:       128783910 * 4 * 1024,
+		PgIn:       40092731521 * 4 * 1024,
+		PgOut:      601586884 * 4 * 1024,
+		PgFault:    1086111781 * 4 * 1024,
+		PgMajFault: 166633543 * 4 * 1024,
+	}
+	newUnits := &SwapMemoryStat{
+		Sin:        136604654 * 4 * 1024,
+		Sout:       128783910 * 4 * 1024,
+		PgIn:       40092731521 * 1024,
+		PgOut:      601586884 * 1024,
+		PgFault:    1086111781,
+		PgMajFault: 166633543,
+	}
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		want *SwapMemoryStat
+	}{
+		{"default", context.Background(), oldUnits},
+		{"opt-in", withOptIn(true), newUnits},
+		{"opt-in false", withOptIn(false), oldUnits},
+		{"opt-in non-bool", withOptIn("true"), oldUnits},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stat, err := SwapMemoryWithContext(tc.ctx)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want.Sin, stat.Sin)
+			assert.Equal(t, tc.want.Sout, stat.Sout)
+			assert.Equal(t, tc.want.PgIn, stat.PgIn)
+			assert.Equal(t, tc.want.PgOut, stat.PgOut)
+			assert.Equal(t, tc.want.PgFault, stat.PgFault)
+			assert.Equal(t, tc.want.PgMajFault, stat.PgMajFault)
+		})
+	}
+}
+
+const validFile = `Filename				Type		Size		Used		Priority
+/dev/dm-2                               partition	67022844	490788		-2
+/swapfile                               file		2		1		-3
+`
+
+const invalidFile = `INVALID				Type		Size		Used		Priority
+/dev/dm-2                               partition	67022844	490788		-2
+/swapfile                               file		1048572		0		-3
+`
+
+func TestParseSwapsFile_ValidFile(t *testing.T) {
+	stats, err := parseSwapsFile(context.Background(), strings.NewReader(validFile))
+	require.NoError(t, err)
+
+	assert.Equal(t, SwapDevice{
+		Name:      "/dev/dm-2",
+		UsedBytes: 502566912,
+		FreeBytes: 68128825344,
+	}, *stats[0])
+
+	assert.Equal(t, SwapDevice{
+		Name:      "/swapfile",
+		UsedBytes: 1024,
+		FreeBytes: 1024,
+	}, *stats[1])
+}
+
+func TestParseSwapsFile_InvalidFile(t *testing.T) {
+	_, err := parseSwapsFile(context.Background(), strings.NewReader(invalidFile))
+	assert.Error(t, err)
+}
+
+func TestParseSwapsFile_EmptyFile(t *testing.T) {
+	_, err := parseSwapsFile(context.Background(), strings.NewReader(""))
+	assert.Error(t, err)
+}
+
+// A data row with too few columns must return an error, not panic.
+func TestParseSwapsFile_ShortDataRow(t *testing.T) {
+	shortRow := "Filename\tType\tSize\tUsed\tPriority\n/dev/dm-2\tpartition\t1024\n"
+	_, err := parseSwapsFile(context.Background(), strings.NewReader(shortRow))
+	assert.Error(t, err)
+}
+
+// A header row with too few columns must return an error, not panic.
+func TestParseSwapsFile_ShortHeader(t *testing.T) {
+	shortHeader := "Filename\tType\tSize\n"
+	_, err := parseSwapsFile(context.Background(), strings.NewReader(shortHeader))
+	assert.Error(t, err)
 }

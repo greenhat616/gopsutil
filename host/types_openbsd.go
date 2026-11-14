@@ -1,4 +1,5 @@
-// +build ignore
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build ignore
 
 /*
 Input to cgo -godefs.
@@ -39,5 +40,7 @@ type (
 	_C_long_long C.longlong
 )
 
-type Utmp C.struct_utmp
-type Timeval C.struct_timeval
+type (
+	Utmp    C.struct_utmp
+	Timeval C.struct_timeval
+)

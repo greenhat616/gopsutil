@@ -1,4 +1,5 @@
-// +build ignore
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build ignore
 
 // We still need editing by hands.
 // go tool cgo -godefs types_openbsd.go | sed 's/\*int64/int64/' | sed 's/\*byte/int64/'  > process_openbsd_amd64.go
@@ -43,6 +44,7 @@ const (
 	KernProcProc     = 8  // only return procs
 	KernProcPathname = 12 // path to executable
 	KernProcArgs     = 55 // get/set arguments/proctitle
+	KernProcCwd      = 78 // get current working directory
 	KernProcArgv     = 1
 	KernProcEnv      = 3
 )

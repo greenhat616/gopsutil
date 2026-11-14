@@ -1,4 +1,5 @@
-// +build freebsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build freebsd
 
 package host
 
@@ -6,15 +7,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"strings"
 	"unsafe"
 
-	"github.com/shirou/gopsutil/internal/common"
-	"github.com/shirou/gopsutil/process"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/shirou/gopsutil/v4/process"
 )
 
 const (
@@ -23,7 +25,7 @@ const (
 	UTHostSize = 16
 )
 
-func HostIDWithContext(ctx context.Context) (string, error) {
+func HostIDWithContext(_ context.Context) (string, error) {
 	uuid, err := unix.Sysctl("kern.hostuuid")
 	if err != nil {
 		return "", err
@@ -39,7 +41,7 @@ func numProcs(ctx context.Context) (uint64, error) {
 	return uint64(len(procs)), nil
 }
 
-func UsersWithContext(ctx context.Context) ([]UserStat, error) {
+func UsersWithContext(_ context.Context) ([]UserStat, error) {
 	utmpfile := "/var/run/utx.active"
 	if !common.PathExists(utmpfile) {
 		utmpfile = "/var/run/utmp" // before 9.0
@@ -53,7 +55,7 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 	}
 	defer file.Close()
 
-	buf, err := ioutil.ReadAll(file)
+	buf, err := io.ReadAll(file)
 	if err != nil {
 		return ret, err
 	}
@@ -81,10 +83,9 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 	}
 
 	return ret, nil
-
 }
 
-func PlatformInformationWithContext(ctx context.Context) (string, string, string, error) {
+func PlatformInformationWithContext(_ context.Context) (string, string, string, error) {
 	platform, err := unix.Sysctl("kern.ostype")
 	if err != nil {
 		return "", "", "", err
@@ -98,7 +99,7 @@ func PlatformInformationWithContext(ctx context.Context) (string, string, string
 	return strings.ToLower(platform), "", strings.ToLower(version), nil
 }
 
-func VirtualizationWithContext(ctx context.Context) (string, string, error) {
+func VirtualizationWithContext(_ context.Context) (string, string, error) {
 	return "", "", common.ErrNotImplementedError
 }
 
@@ -111,13 +112,12 @@ func getUsersFromUtmp(utmpfile string) ([]UserStat, error) {
 	}
 	defer file.Close()
 
-	buf, err := ioutil.ReadAll(file)
+	buf, err := io.ReadAll(file)
 	if err != nil {
 		return ret, err
 	}
 
-	u := Utmp{}
-	entrySize := int(unsafe.Sizeof(u))
+	entrySize := int(unsafe.Sizeof(Utmp{}))
 	count := len(buf) / entrySize
 
 	for i := 0; i < count; i++ {
@@ -139,10 +139,6 @@ func getUsersFromUtmp(utmpfile string) ([]UserStat, error) {
 	}
 
 	return ret, nil
-}
-
-func SensorsTemperaturesWithContext(ctx context.Context) ([]TemperatureStat, error) {
-	return []TemperatureStat{}, common.ErrNotImplementedError
 }
 
 func KernelVersionWithContext(ctx context.Context) (string, error) {

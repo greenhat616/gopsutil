@@ -1,21 +1,31 @@
-// +build windows
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build windows
 
 package process
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
-	"strings"
+	"path/filepath"
+	"reflect"
 	"syscall"
+	"time"
+	"unicode/utf16"
 	"unsafe"
 
-	cpu "github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/internal/common"
-	net "github.com/shirou/gopsutil/net"
 	"golang.org/x/sys/windows"
+
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/shirou/gopsutil/v4/net"
 )
+
+type Signal = syscall.Signal
 
 var (
 	modntdll             = windows.NewLazySystemDLL("ntdll.dll")
@@ -34,26 +44,12 @@ var (
 	procGetPriorityClass           = common.Modkernel32.NewProc("GetPriorityClass")
 	procGetProcessIoCounters       = common.Modkernel32.NewProc("GetProcessIoCounters")
 	procGetNativeSystemInfo        = common.Modkernel32.NewProc("GetNativeSystemInfo")
+	procGetProcessHandleCount      = common.Modkernel32.NewProc("GetProcessHandleCount")
 
 	processorArchitecture uint
 )
 
-const processQueryInformation = windows.PROCESS_QUERY_LIMITED_INFORMATION | windows.PROCESS_QUERY_INFORMATION // WinXP doesn't know PROCESS_QUERY_LIMITED_INFORMATION
-
-type SystemProcessInformation struct {
-	NextEntryOffset   uint64
-	NumberOfThreads   uint64
-	Reserved1         [48]byte
-	Reserved2         [3]byte
-	UniqueProcessID   uintptr
-	Reserved3         uintptr
-	HandleCount       uint64
-	Reserved4         [4]byte
-	Reserved5         [11]byte
-	PeakPagefileUsage uint64
-	PrivatePageCount  uint64
-	Reserved6         [6]uint64
-}
+const processQueryInformation = windows.PROCESS_QUERY_LIMITED_INFORMATION
 
 type systemProcessorInformation struct {
 	ProcessorArchitecture uint16
@@ -66,7 +62,7 @@ type systemProcessorInformation struct {
 type systemInfo struct {
 	wProcessorArchitecture      uint16
 	wReserved                   uint16
-	dwPageSize                  uint32
+	dwpageSize                  uint32
 	lpMinimumApplicationAddress uintptr
 	lpMaximumApplicationAddress uintptr
 	dwActiveProcessorMask       uintptr
@@ -78,11 +74,9 @@ type systemInfo struct {
 }
 
 // Memory_info_ex is different between OSes
-type MemoryInfoExStat struct {
-}
+type MemoryInfoExStat struct{}
 
-type MemoryMapsStat struct {
-}
+type MemoryMapsStat struct{}
 
 // ioCounters is an equivalent representation of IO_COUNTERS in the Windows API.
 // https://docs.microsoft.com/windows/win32/api/winnt/ns-winnt-io_counters
@@ -113,6 +107,79 @@ type processBasicInformation64 struct {
 	Reserved4       uint64
 }
 
+type processEnvironmentBlock32 struct {
+	Reserved1         [2]uint8
+	BeingDebugged     uint8
+	Reserved2         uint8
+	Reserved3         [2]uint32
+	Ldr               uint32
+	ProcessParameters uint32
+	// More fields which we don't use so far
+}
+
+type processEnvironmentBlock64 struct {
+	Reserved1         [2]uint8
+	BeingDebugged     uint8
+	Reserved2         uint8
+	_                 [4]uint8 // padding, since we are 64 bit, the next pointer is 64 bit aligned (when compiling for 32 bit, this is not the case without manual padding)
+	Reserved3         [2]uint64
+	Ldr               uint64
+	ProcessParameters uint64
+	// More fields which we don't use so far
+}
+
+type rtlUserProcessParameters32 struct {
+	Reserved1                      [16]uint8
+	ConsoleHandle                  uint32
+	ConsoleFlags                   uint32
+	StdInputHandle                 uint32
+	StdOutputHandle                uint32
+	StdErrorHandle                 uint32
+	CurrentDirectoryPathNameLength uint16
+	_                              uint16 // Max Length
+	CurrentDirectoryPathAddress    uint32
+	CurrentDirectoryHandle         uint32
+	DllPathNameLength              uint16
+	_                              uint16 // Max Length
+	DllPathAddress                 uint32
+	ImagePathNameLength            uint16
+	_                              uint16 // Max Length
+	ImagePathAddress               uint32
+	CommandLineLength              uint16
+	_                              uint16 // Max Length
+	CommandLineAddress             uint32
+	EnvironmentAddress             uint32
+	// More fields which we don't use so far
+}
+
+type rtlUserProcessParameters64 struct {
+	Reserved1                      [16]uint8
+	ConsoleHandle                  uint64
+	ConsoleFlags                   uint64
+	StdInputHandle                 uint64
+	StdOutputHandle                uint64
+	StdErrorHandle                 uint64
+	CurrentDirectoryPathNameLength uint16
+	_                              uint16 // Max Length
+	_                              uint32 // Padding
+	CurrentDirectoryPathAddress    uint64
+	CurrentDirectoryHandle         uint64
+	DllPathNameLength              uint16
+	_                              uint16 // Max Length
+	_                              uint32 // Padding
+	DllPathAddress                 uint64
+	ImagePathNameLength            uint16
+	_                              uint16 // Max Length
+	_                              uint32 // Padding
+	ImagePathAddress               uint64
+	CommandLineLength              uint16
+	_                              uint16 // Max Length
+	_                              uint32 // Padding
+	CommandLineAddress             uint64
+	EnvironmentAddress             uint64
+	// More fields which we don't use so far
+}
+
 type winLUID struct {
 	LowPart  winDWord
 	HighPart winLong
@@ -125,19 +192,21 @@ type winLUIDAndAttributes struct {
 }
 
 // TOKEN_PRIVILEGES
-type winTokenPriviledges struct {
+type winTokenPrivileges struct {
 	PrivilegeCount winDWord
 	Privileges     [1]winLUIDAndAttributes
 }
 
-type winLong int32
-type winDWord uint32
+type (
+	winLong  int32
+	winDWord uint32
+)
 
 func init() {
-	var systemInfo systemInfo
+	var sInfo systemInfo
 
-	procGetNativeSystemInfo.Call(uintptr(unsafe.Pointer(&systemInfo)))
-	processorArchitecture = uint(systemInfo.wProcessorArchitecture)
+	procGetNativeSystemInfo.Call(uintptr(unsafe.Pointer(&sInfo)))
+	processorArchitecture = uint(sInfo.wProcessorArchitecture)
 
 	// enable SeDebugPrivilege https://github.com/midstar/proci/blob/6ec79f57b90ba3d9efa2a7b16ef9c9369d4be875/proci_windows.go#L80-L119
 	handle, err := syscall.GetCurrentProcess()
@@ -152,32 +221,32 @@ func init() {
 	}
 	defer token.Close()
 
-	tokenPriviledges := winTokenPriviledges{PrivilegeCount: 1}
+	tokenPrivileges := winTokenPrivileges{PrivilegeCount: 1}
 	lpName := syscall.StringToUTF16("SeDebugPrivilege")
 	ret, _, _ := procLookupPrivilegeValue.Call(
 		0,
 		uintptr(unsafe.Pointer(&lpName[0])),
-		uintptr(unsafe.Pointer(&tokenPriviledges.Privileges[0].Luid)))
+		uintptr(unsafe.Pointer(&tokenPrivileges.Privileges[0].Luid)))
 	if ret == 0 {
 		return
 	}
 
-	tokenPriviledges.Privileges[0].Attributes = 0x00000002 // SE_PRIVILEGE_ENABLED
+	tokenPrivileges.Privileges[0].Attributes = 0x00000002 // SE_PRIVILEGE_ENABLED
 
 	procAdjustTokenPrivileges.Call(
 		uintptr(token),
 		0,
-		uintptr(unsafe.Pointer(&tokenPriviledges)),
-		uintptr(unsafe.Sizeof(tokenPriviledges)),
+		uintptr(unsafe.Pointer(&tokenPrivileges)),
+		uintptr(unsafe.Sizeof(tokenPrivileges)),
 		0,
 		0)
 }
 
-func pidsWithContext(ctx context.Context) ([]int32, error) {
+func pidsWithContext(_ context.Context) ([]int32, error) {
 	// inspired by https://gist.github.com/henkman/3083408
 	// and https://github.com/giampaolo/psutil/blob/1c3a15f637521ba5c0031283da39c733fda53e4c/psutil/arch/windows/process_info.c#L315-L329
 	var ret []int32
-	var read uint32 = 0
+	var read uint32
 	var psSize uint32 = 1024
 	const dwordSize uint32 = 4
 
@@ -186,7 +255,7 @@ func pidsWithContext(ctx context.Context) ([]int32, error) {
 		if err := windows.EnumProcesses(ps, &read); err != nil {
 			return nil, err
 		}
-		if uint32(len(ps)) == read { // ps buffer was too small to host every results, retry with a bigger one
+		if uint32(len(ps)) == read/dwordSize { // ps buffer was too small to host every results, retry with a bigger one
 			psSize += 1024
 			continue
 		}
@@ -196,7 +265,6 @@ func pidsWithContext(ctx context.Context) ([]int32, error) {
 		return ret, nil
 
 	}
-
 }
 
 func PidExistsWithContext(ctx context.Context, pid int32) (bool, error) {
@@ -220,24 +288,22 @@ func PidExistsWithContext(ctx context.Context, pid int32) (bool, error) {
 		}
 		return false, err
 	}
-	const STILL_ACTIVE = 259 // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess
-	h, err := windows.OpenProcess(processQueryInformation, false, uint32(pid))
-	if err == windows.ERROR_ACCESS_DENIED {
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		return true, nil
 	}
-	if err == windows.ERROR_INVALID_PARAMETER {
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	defer syscall.CloseHandle(syscall.Handle(h))
-	var exitCode uint32
-	err = windows.GetExitCodeProcess(h, &exitCode)
-	return exitCode == STILL_ACTIVE, err
+	defer windows.CloseHandle(h)
+	event, err := windows.WaitForSingleObject(h, 0)
+	return event == uint32(windows.WAIT_TIMEOUT), err
 }
 
-func (p *Process) PpidWithContext(ctx context.Context) (int32, error) {
+func (p *Process) PpidWithContext(_ context.Context) (int32, error) {
 	// if cached already, return from cache
 	cachedPpid := p.getPpid()
 	if cachedPpid != 0 {
@@ -256,25 +322,31 @@ func (p *Process) PpidWithContext(ctx context.Context) (int32, error) {
 }
 
 func (p *Process) NameWithContext(ctx context.Context) (string, error) {
-	ppid, _, name, err := getFromSnapProcess(p.Pid)
+	if p.Pid == 0 {
+		return "System Idle Process", nil
+	}
+	if p.name != "" {
+		return p.name, nil
+	}
+	if p.Pid == 4 {
+		return "System", nil
+	}
+
+	exe, err := p.ExeWithContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("could not get Name: %s", err)
+		return "", fmt.Errorf("could not get Name: %w", err)
 	}
 
-	// if no errors and not cached already, cache ppid
-	p.parent = ppid
-	if 0 == p.getPpid() {
-		p.setPpid(ppid)
-	}
-
+	name := filepath.Base(exe)
+	p.name = name
 	return name, nil
 }
 
-func (p *Process) TgidWithContext(ctx context.Context) (int32, error) {
+func (*Process) TgidWithContext(_ context.Context) (int32, error) {
 	return 0, common.ErrNotImplementedError
 }
 
-func (p *Process) ExeWithContext(ctx context.Context) (string, error) {
+func (p *Process) ExeWithContext(_ context.Context) (string, error) {
 	c, err := windows.OpenProcess(processQueryInformation, false, uint32(p.Pid))
 	if err != nil {
 		return "", err
@@ -291,20 +363,20 @@ func (p *Process) ExeWithContext(ctx context.Context) (string, error) {
 		if ret == 0 {
 			return "", err
 		}
-		return windows.UTF16ToString(buf[:]), nil
+		return windows.UTF16ToString(buf), nil
 	}
 	// XP fallback
 	ret, _, err := procGetProcessImageFileNameW.Call(uintptr(c), uintptr(unsafe.Pointer(&buf[0])), uintptr(size))
 	if ret == 0 {
 		return "", err
 	}
-	return common.ConvertDOSPath(windows.UTF16ToString(buf[:])), nil
+	return common.ConvertDOSPath(windows.UTF16ToString(buf)), nil
 }
 
 func (p *Process) CmdlineWithContext(_ context.Context) (string, error) {
 	cmdline, err := getProcessCommandLine(p.Pid)
 	if err != nil {
-		return "", fmt.Errorf("could not get CommandLine: %s", err)
+		return "", fmt.Errorf("could not get CommandLine: %w", err)
 	}
 	return cmdline, nil
 }
@@ -314,40 +386,91 @@ func (p *Process) CmdlineSliceWithContext(ctx context.Context) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
-	return strings.Split(cmdline, " "), nil
+	return parseCmdline(cmdline)
 }
 
-func (p *Process) createTimeWithContext(ctx context.Context) (int64, error) {
+func parseCmdline(cmdline string) ([]string, error) {
+	cmdlineptr, err := windows.UTF16PtrFromString(cmdline)
+	if err != nil {
+		return nil, err
+	}
+
+	var argc int32
+	argvptr, err := windows.CommandLineToArgv(cmdlineptr, &argc)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(argvptr))))
+
+	argv := make([]string, argc)
+	for i, v := range (*argvptr)[:argc] {
+		argv[i] = windows.UTF16ToString((*v)[:])
+	}
+	return argv, nil
+}
+
+func (p *Process) createTimeWithContext(_ context.Context) (int64, error) {
 	ru, err := getRusage(p.Pid)
 	if err != nil {
-		return 0, fmt.Errorf("could not get CreationDate: %s", err)
+		return 0, fmt.Errorf("could not get CreationDate: %w", err)
 	}
 
 	return ru.CreationTime.Nanoseconds() / 1000000, nil
 }
 
-func (p *Process) CwdWithContext(ctx context.Context) (string, error) {
-	return "", common.ErrNotImplementedError
-}
-
-func (p *Process) ParentWithContext(ctx context.Context) (*Process, error) {
-	ppid, err := p.PpidWithContext(ctx)
+func (p *Process) CwdWithContext(_ context.Context) (string, error) {
+	h, err := windows.OpenProcess(processQueryInformation|windows.PROCESS_VM_READ, false, uint32(p.Pid))
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return "", nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("could not get ParentProcessID: %s", err)
+		return "", err
+	}
+	defer syscall.CloseHandle(syscall.Handle(h))
+
+	procIs32Bits := is32BitProcess(h)
+
+	if procIs32Bits {
+		userProcParams, err := getUserProcessParams32(h)
+		if err != nil {
+			return "", err
+		}
+		if userProcParams.CurrentDirectoryPathNameLength > 0 {
+			cwd := readProcessMemory(syscall.Handle(h), procIs32Bits, uint64(userProcParams.CurrentDirectoryPathAddress), uint(userProcParams.CurrentDirectoryPathNameLength))
+			if len(cwd) != int(userProcParams.CurrentDirectoryPathNameLength) {
+				return "", errors.New("cannot read current working directory")
+			}
+
+			return convertUTF16ToString(cwd), nil
+		}
+	} else {
+		userProcParams, err := getUserProcessParams64(h)
+		if err != nil {
+			return "", err
+		}
+		if userProcParams.CurrentDirectoryPathNameLength > 0 {
+			cwd := readProcessMemory(syscall.Handle(h), procIs32Bits, userProcParams.CurrentDirectoryPathAddress, uint(userProcParams.CurrentDirectoryPathNameLength))
+			if len(cwd) != int(userProcParams.CurrentDirectoryPathNameLength) {
+				return "", errors.New("cannot read current working directory")
+			}
+
+			return convertUTF16ToString(cwd), nil
+		}
 	}
 
-	return NewProcessWithContext(ctx, ppid)
+	// if we reach here, we have no cwd
+	return "", nil
 }
 
-func (p *Process) StatusWithContext(ctx context.Context) (string, error) {
-	return "", common.ErrNotImplementedError
+func (*Process) StatusWithContext(_ context.Context) ([]string, error) {
+	return []string{""}, common.ErrNotImplementedError
 }
 
-func (p *Process) ForegroundWithContext(ctx context.Context) (bool, error) {
+func (*Process) ForegroundWithContext(_ context.Context) (bool, error) {
 	return false, common.ErrNotImplementedError
 }
 
-func (p *Process) UsernameWithContext(ctx context.Context) (string, error) {
+func (p *Process) UsernameWithContext(_ context.Context) (string, error) {
 	pid := p.Pid
 	c, err := windows.OpenProcess(processQueryInformation, false, uint32(pid))
 	if err != nil {
@@ -370,19 +493,19 @@ func (p *Process) UsernameWithContext(ctx context.Context) (string, error) {
 	return domain + "\\" + user, err
 }
 
-func (p *Process) UidsWithContext(ctx context.Context) ([]int32, error) {
+func (*Process) UidsWithContext(_ context.Context) ([]uint32, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) GidsWithContext(ctx context.Context) ([]int32, error) {
+func (*Process) GidsWithContext(_ context.Context) ([]uint32, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) GroupsWithContext(ctx context.Context) ([]int32, error) {
+func (*Process) GroupsWithContext(_ context.Context) ([]uint32, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) TerminalWithContext(ctx context.Context) (string, error) {
+func (*Process) TerminalWithContext(_ context.Context) (string, error) {
 	return "", common.ErrNotImplementedError
 }
 
@@ -398,7 +521,7 @@ var priorityClasses = map[int]int32{
 	0x00000100: 24, // REALTIME_PRIORITY_CLASS
 }
 
-func (p *Process) NiceWithContext(ctx context.Context) (int32, error) {
+func (p *Process) NiceWithContext(_ context.Context) (int32, error) {
 	c, err := windows.OpenProcess(processQueryInformation, false, uint32(p.Pid))
 	if err != nil {
 		return 0, err
@@ -415,48 +538,61 @@ func (p *Process) NiceWithContext(ctx context.Context) (int32, error) {
 	return priority, nil
 }
 
-func (p *Process) IOniceWithContext(ctx context.Context) (int32, error) {
+func (*Process) IOniceWithContext(_ context.Context) (int32, error) {
 	return 0, common.ErrNotImplementedError
 }
 
-func (p *Process) RlimitWithContext(ctx context.Context) ([]RlimitStat, error) {
+func (*Process) RlimitWithContext(_ context.Context) ([]RlimitStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) RlimitUsageWithContext(ctx context.Context, gatherUsed bool) ([]RlimitStat, error) {
+func (*Process) RlimitUsageWithContext(_ context.Context, _ bool) ([]RlimitStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) IOCountersWithContext(ctx context.Context) (*IOCountersStat, error) {
+func (p *Process) IOCountersWithContext(_ context.Context) (*IOCountersStat, error) {
 	c, err := windows.OpenProcess(processQueryInformation, false, uint32(p.Pid))
 	if err != nil {
 		return nil, err
 	}
 	defer windows.CloseHandle(c)
-	var ioCounters ioCounters
-	ret, _, err := procGetProcessIoCounters.Call(uintptr(c), uintptr(unsafe.Pointer(&ioCounters)))
+	var counters ioCounters
+	ret, _, err := procGetProcessIoCounters.Call(uintptr(c), uintptr(unsafe.Pointer(&counters)))
 	if ret == 0 {
 		return nil, err
 	}
 	stats := &IOCountersStat{
-		ReadCount:  ioCounters.ReadOperationCount,
-		ReadBytes:  ioCounters.ReadTransferCount,
-		WriteCount: ioCounters.WriteOperationCount,
-		WriteBytes: ioCounters.WriteTransferCount,
+		ReadCount:  counters.ReadOperationCount,
+		ReadBytes:  counters.ReadTransferCount,
+		WriteCount: counters.WriteOperationCount,
+		WriteBytes: counters.WriteTransferCount,
 	}
 
 	return stats, nil
 }
 
-func (p *Process) NumCtxSwitchesWithContext(ctx context.Context) (*NumCtxSwitchesStat, error) {
+func (*Process) NumCtxSwitchesWithContext(_ context.Context) (*NumCtxSwitchesStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) NumFDsWithContext(ctx context.Context) (int32, error) {
-	return 0, common.ErrNotImplementedError
+// NumFDsWithContext returns the number of handles for a process on Windows,
+// not the number of file descriptors (FDs).
+func (p *Process) NumFDsWithContext(_ context.Context) (int32, error) {
+	handle, err := windows.OpenProcess(processQueryInformation, false, uint32(p.Pid))
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(handle)
+
+	var handleCount uint32
+	ret, _, err := procGetProcessHandleCount.Call(uintptr(handle), uintptr(unsafe.Pointer(&handleCount)))
+	if ret == 0 {
+		return 0, err
+	}
+	return int32(handleCount), nil
 }
 
-func (p *Process) NumThreadsWithContext(ctx context.Context) (int32, error) {
+func (p *Process) NumThreadsWithContext(_ context.Context) (int32, error) {
 	ppid, ret, _, err := getFromSnapProcess(p.Pid)
 	if err != nil {
 		return 0, err
@@ -464,18 +600,20 @@ func (p *Process) NumThreadsWithContext(ctx context.Context) (int32, error) {
 
 	// if no errors and not cached already, cache ppid
 	p.parent = ppid
-	if 0 == p.getPpid() {
+	if p.getPpid() == 0 {
 		p.setPpid(ppid)
 	}
+
+	p.numThreads = ret
 
 	return ret, nil
 }
 
-func (p *Process) ThreadsWithContext(ctx context.Context) (map[int32]*cpu.TimesStat, error) {
+func (*Process) ThreadsWithContext(_ context.Context) (map[int32]*cpu.TimesStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) TimesWithContext(ctx context.Context) (*cpu.TimesStat, error) {
+func (p *Process) TimesWithContext(_ context.Context) (*cpu.TimesStat, error) {
 	sysTimes, err := getProcessCPUTimes(p.Pid)
 	if err != nil {
 		return nil, err
@@ -499,11 +637,11 @@ func (p *Process) TimesWithContext(ctx context.Context) (*cpu.TimesStat, error) 
 	}, nil
 }
 
-func (p *Process) CPUAffinityWithContext(ctx context.Context) ([]int32, error) {
+func (*Process) CPUAffinityWithContext(_ context.Context) ([]int32, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) MemoryInfoWithContext(ctx context.Context) (*MemoryInfoStat, error) {
+func (p *Process) MemoryInfoWithContext(_ context.Context) (*MemoryInfoStat, error) {
 	mem, err := getMemoryInfo(p.Pid)
 	if err != nil {
 		return nil, err
@@ -517,12 +655,22 @@ func (p *Process) MemoryInfoWithContext(ctx context.Context) (*MemoryInfoStat, e
 	return ret, nil
 }
 
-func (p *Process) MemoryInfoExWithContext(ctx context.Context) (*MemoryInfoExStat, error) {
+func (*Process) MemoryInfoExWithContext(_ context.Context) (*MemoryInfoExStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) PageFaultsWithContext(ctx context.Context) (*PageFaultsStat, error) {
-	return nil, common.ErrNotImplementedError
+func (p *Process) PageFaultsWithContext(_ context.Context) (*PageFaultsStat, error) {
+	mem, err := getMemoryInfo(p.Pid)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &PageFaultsStat{
+		// Since Windows does not distinguish between Major and Minor faults, all faults are treated as Major
+		MajorFaults: uint64(mem.PageFaultCount),
+	}
+
+	return ret, nil
 }
 
 func (p *Process) ChildrenWithContext(ctx context.Context) ([]*Process, error) {
@@ -552,30 +700,117 @@ func (p *Process) ChildrenWithContext(ctx context.Context) ([]*Process, error) {
 }
 
 func (p *Process) OpenFilesWithContext(ctx context.Context) ([]OpenFilesStat, error) {
-	return nil, common.ErrNotImplementedError
+	files := make([]OpenFilesStat, 0)
+	fileExists := make(map[string]bool)
+
+	process, err := windows.OpenProcess(common.ProcessQueryInformation, false, uint32(p.Pid))
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(process)
+
+	buffer := make([]byte, 1024)
+	var size uint32
+
+	st := common.CallWithExpandingBuffer(
+		func() common.NtStatus {
+			return common.NtQuerySystemInformation(
+				common.SystemExtendedHandleInformationClass,
+				&buffer[0],
+				uint32(len(buffer)),
+				&size,
+			)
+		},
+		&buffer,
+		&size,
+	)
+	if st.IsError() {
+		return nil, st.Error()
+	}
+
+	handlesList := (*common.SystemExtendedHandleInformation)(unsafe.Pointer(&buffer[0]))
+	handles := make([]common.SystemExtendedHandleTableEntryInformation, int(handlesList.NumberOfHandles))
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&handles))
+	hdr.Data = uintptr(unsafe.Pointer(&handlesList.Handles[0]))
+
+	currentProcess, err := windows.GetCurrentProcess()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, handle := range handles {
+		var file uintptr
+		if int32(handle.UniqueProcessId) != p.Pid {
+			continue
+		}
+		if windows.DuplicateHandle(process, windows.Handle(handle.HandleValue), currentProcess, (*windows.Handle)(&file),
+			0, true, windows.DUPLICATE_SAME_ACCESS) != nil {
+			continue
+		}
+		// release the new handle
+		defer windows.CloseHandle(windows.Handle(file))
+
+		fileType, err := windows.GetFileType(windows.Handle(file))
+		if err != nil || fileType != windows.FILE_TYPE_DISK {
+			continue
+		}
+
+		var fileName string
+		ch := make(chan struct{}, 1)
+
+		go func() {
+			defer close(ch)
+			var buf [syscall.MAX_LONG_PATH]uint16
+			n, err := windows.GetFinalPathNameByHandle(windows.Handle(file), &buf[0], syscall.MAX_LONG_PATH, 0)
+			if err != nil {
+				return
+			}
+
+			fileName = string(utf16.Decode(buf[:n]))
+			ch <- struct{}{}
+		}()
+
+		select {
+		case <-time.NewTimer(100 * time.Millisecond).C:
+			continue
+		case <-ch:
+			fileInfo, err := os.Stat(fileName)
+			if err != nil || fileInfo.IsDir() {
+				continue
+			}
+
+			if _, exists := fileExists[fileName]; !exists {
+				files = append(files, OpenFilesStat{
+					Path: fileName,
+					Fd:   uint64(file),
+				})
+				fileExists[fileName] = true
+			}
+		case <-ctx.Done():
+			return files, ctx.Err()
+		}
+	}
+
+	return files, nil
 }
 
 func (p *Process) ConnectionsWithContext(ctx context.Context) ([]net.ConnectionStat, error) {
 	return net.ConnectionsPidWithContext(ctx, "all", p.Pid)
 }
 
-func (p *Process) ConnectionsMaxWithContext(ctx context.Context, max int) ([]net.ConnectionStat, error) {
+func (*Process) ConnectionsMaxWithContext(_ context.Context, _ int) ([]net.ConnectionStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) NetIOCountersWithContext(ctx context.Context, pernic bool) ([]net.IOCountersStat, error) {
+func (*Process) MemoryMapsWithContext(_ context.Context, _ bool) (*[]MemoryMapsStat, error) {
 	return nil, common.ErrNotImplementedError
 }
 
-func (p *Process) MemoryMapsWithContext(ctx context.Context, grouped bool) (*[]MemoryMapsStat, error) {
-	return nil, common.ErrNotImplementedError
-}
-
-func (p *Process) SendSignalWithContext(ctx context.Context, sig syscall.Signal) error {
+func (*Process) SendSignalWithContext(_ context.Context, _ syscall.Signal) error {
 	return common.ErrNotImplementedError
 }
 
-func (p *Process) SuspendWithContext(ctx context.Context) error {
+func (p *Process) SuspendWithContext(_ context.Context) error {
 	c, err := windows.OpenProcess(windows.PROCESS_SUSPEND_RESUME, false, uint32(p.Pid))
 	if err != nil {
 		return err
@@ -591,7 +826,7 @@ func (p *Process) SuspendWithContext(ctx context.Context) error {
 	return nil
 }
 
-func (p *Process) ResumeWithContext(ctx context.Context) error {
+func (p *Process) ResumeWithContext(_ context.Context) error {
 	c, err := windows.OpenProcess(windows.PROCESS_SUSPEND_RESUME, false, uint32(p.Pid))
 	if err != nil {
 		return err
@@ -607,7 +842,7 @@ func (p *Process) ResumeWithContext(ctx context.Context) error {
 	return nil
 }
 
-func (p *Process) TerminateWithContext(ctx context.Context) error {
+func (p *Process) TerminateWithContext(_ context.Context) error {
 	proc, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(p.Pid))
 	if err != nil {
 		return err
@@ -617,9 +852,21 @@ func (p *Process) TerminateWithContext(ctx context.Context) error {
 	return err
 }
 
-func (p *Process) KillWithContext(ctx context.Context) error {
-	process := os.Process{Pid: int(p.Pid)}
+func (p *Process) KillWithContext(_ context.Context) error {
+	process, err := os.FindProcess(int(p.Pid))
+	if err != nil {
+		return err
+	}
+	defer process.Release()
 	return process.Kill()
+}
+
+func (p *Process) EnvironWithContext(ctx context.Context) ([]string, error) {
+	envVars, err := getProcessEnvironmentVariables(ctx, p.Pid)
+	if err != nil {
+		return nil, fmt.Errorf("could not get environment variables: %w", err)
+	}
+	return envVars, nil
 }
 
 // retrieve Ppid in a thread-safe manner
@@ -637,7 +884,7 @@ func (p *Process) setPpid(ppid int32) {
 	p.parent = ppid
 }
 
-func getFromSnapProcess(pid int32) (int32, int32, string, error) {
+func getFromSnapProcess(pid int32) (int32, int32, string, error) { //nolint:unparam //FIXME
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, uint32(pid))
 	if err != nil {
 		return 0, 0, "", err
@@ -645,7 +892,8 @@ func getFromSnapProcess(pid int32) (int32, int32, string, error) {
 	defer windows.CloseHandle(snap)
 	var pe32 windows.ProcessEntry32
 	pe32.Size = uint32(unsafe.Sizeof(pe32))
-	if err = windows.Process32First(snap, &pe32); err != nil {
+	err = windows.Process32First(snap, &pe32)
+	if err != nil {
 		return 0, 0, "", err
 	}
 	for {
@@ -660,12 +908,45 @@ func getFromSnapProcess(pid int32) (int32, int32, string, error) {
 	return 0, 0, "", fmt.Errorf("couldn't find pid: %d", pid)
 }
 
+func buildSnapProcessMap() (map[uint32]windows.ProcessEntry32, error) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(snap)
+
+	var pe32 windows.ProcessEntry32
+	pe32.Size = uint32(unsafe.Sizeof(pe32))
+	if err := windows.Process32First(snap, &pe32); err != nil {
+		return nil, err
+	}
+
+	snapMap := make(map[uint32]windows.ProcessEntry32)
+	for {
+		snapMap[pe32.ProcessID] = pe32
+		if err := windows.Process32Next(snap, &pe32); err != nil {
+			if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+				break
+			}
+			return nil, err
+		}
+	}
+	return snapMap, nil
+}
+
 func ProcessesWithContext(ctx context.Context) ([]*Process, error) {
 	out := []*Process{}
 
 	pids, err := PidsWithContext(ctx)
 	if err != nil {
-		return out, fmt.Errorf("could not get Processes %s", err)
+		return out, fmt.Errorf("could not get Processes %w", err)
+	}
+
+	// Note: The PID enumeration and snapshot creation are separate calls
+	// and may not be perfectly consistent due to timing.
+	snapMap, err := buildSnapProcessMap()
+	if err != nil {
+		return out, fmt.Errorf("could not build process snapshot: %w", err)
 	}
 
 	for _, pid := range pids {
@@ -673,6 +954,13 @@ func ProcessesWithContext(ctx context.Context) ([]*Process, error) {
 		if err != nil {
 			continue
 		}
+
+		if entry, ok := snapMap[uint32(pid)]; ok {
+			p.name = windows.UTF16ToString(entry.ExeFile[:])
+			p.setPpid(int32(entry.ParentProcessID))
+			p.numThreads = int32(entry.Threads)
+		}
+
 		out = append(out, p)
 	}
 
@@ -718,10 +1006,10 @@ func getProcessMemoryInfo(h windows.Handle, mem *PROCESS_MEMORY_COUNTERS) (err e
 			err = syscall.EINVAL
 		}
 	}
-	return
+	return err
 }
 
-type SYSTEM_TIMES struct {
+type SYSTEM_TIMES struct { //nolint:revive //FIXME
 	CreateTime syscall.Filetime
 	ExitTime   syscall.Filetime
 	KernelTime syscall.Filetime
@@ -748,39 +1036,45 @@ func getProcessCPUTimes(pid int32) (SYSTEM_TIMES, error) {
 	return times, err
 }
 
-func is32BitProcess(procHandle syscall.Handle) bool {
-	var wow64 uint
-
-	ret, _, _ := common.ProcNtQueryInformationProcess.Call(
-		uintptr(procHandle),
-		uintptr(common.ProcessWow64Information),
-		uintptr(unsafe.Pointer(&wow64)),
-		uintptr(unsafe.Sizeof(wow64)),
-		uintptr(0),
-	)
-	if int(ret) >= 0 {
-		if wow64 != 0 {
-			return true
-		}
-	} else {
-		//if the OS does not support the call, we fallback into the bitness of the app
-		if unsafe.Sizeof(wow64) == 4 {
-			return true
-		}
+func getUserProcessParams32(handle windows.Handle) (rtlUserProcessParameters32, error) {
+	pebAddress, err := queryPebAddress(syscall.Handle(handle), true)
+	if err != nil {
+		return rtlUserProcessParameters32{}, fmt.Errorf("cannot locate process PEB: %w", err)
 	}
-	return false
+
+	buf := readProcessMemory(syscall.Handle(handle), true, pebAddress, uint(unsafe.Sizeof(processEnvironmentBlock32{})))
+	if len(buf) != int(unsafe.Sizeof(processEnvironmentBlock32{})) {
+		return rtlUserProcessParameters32{}, errors.New("cannot read process PEB")
+	}
+	peb := (*processEnvironmentBlock32)(unsafe.Pointer(&buf[0]))
+	userProcessAddress := uint64(peb.ProcessParameters)
+	buf = readProcessMemory(syscall.Handle(handle), true, userProcessAddress, uint(unsafe.Sizeof(rtlUserProcessParameters32{})))
+	if len(buf) != int(unsafe.Sizeof(rtlUserProcessParameters32{})) {
+		return rtlUserProcessParameters32{}, errors.New("cannot read user process parameters")
+	}
+	return *(*rtlUserProcessParameters32)(unsafe.Pointer(&buf[0])), nil
 }
 
-func getProcessCommandLine(pid int32) (string, error) {
-	h, err := windows.OpenProcess(processQueryInformation|windows.PROCESS_VM_READ, false, uint32(pid))
-	if err == windows.ERROR_ACCESS_DENIED || err == windows.ERROR_INVALID_PARAMETER {
-		return "", nil
-	}
+func getUserProcessParams64(handle windows.Handle) (rtlUserProcessParameters64, error) {
+	pebAddress, err := queryPebAddress(syscall.Handle(handle), false)
 	if err != nil {
-		return "", err
+		return rtlUserProcessParameters64{}, fmt.Errorf("cannot locate process PEB: %w", err)
 	}
-	defer syscall.CloseHandle(syscall.Handle(h))
 
+	buf := readProcessMemory(syscall.Handle(handle), false, pebAddress, uint(unsafe.Sizeof(processEnvironmentBlock64{})))
+	if len(buf) != int(unsafe.Sizeof(processEnvironmentBlock64{})) {
+		return rtlUserProcessParameters64{}, errors.New("cannot read process PEB")
+	}
+	peb := (*processEnvironmentBlock64)(unsafe.Pointer(&buf[0]))
+	userProcessAddress := peb.ProcessParameters
+	buf = readProcessMemory(syscall.Handle(handle), false, userProcessAddress, uint(unsafe.Sizeof(rtlUserProcessParameters64{})))
+	if len(buf) != int(unsafe.Sizeof(rtlUserProcessParameters64{})) {
+		return rtlUserProcessParameters64{}, errors.New("cannot read user process parameters")
+	}
+	return *(*rtlUserProcessParameters64)(unsafe.Pointer(&buf[0])), nil
+}
+
+func is32BitProcess(h windows.Handle) bool {
 	const (
 		PROCESSOR_ARCHITECTURE_INTEL = 0
 		PROCESSOR_ARCHITECTURE_ARM   = 5
@@ -789,86 +1083,234 @@ func getProcessCommandLine(pid int32) (string, error) {
 		PROCESSOR_ARCHITECTURE_AMD64 = 9
 	)
 
-	procIs32Bits := true
+	var procIs32Bits bool
 	switch processorArchitecture {
-	case PROCESSOR_ARCHITECTURE_INTEL:
-		fallthrough
-	case PROCESSOR_ARCHITECTURE_ARM:
+	case PROCESSOR_ARCHITECTURE_INTEL, PROCESSOR_ARCHITECTURE_ARM:
 		procIs32Bits = true
+	case PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_IA64, PROCESSOR_ARCHITECTURE_AMD64:
+		var wow64 uint
 
-	case PROCESSOR_ARCHITECTURE_ARM64:
-		fallthrough
-	case PROCESSOR_ARCHITECTURE_IA64:
-		fallthrough
-	case PROCESSOR_ARCHITECTURE_AMD64:
-		procIs32Bits = is32BitProcess(syscall.Handle(h))
+		ret, _, _ := common.ProcNtQueryInformationProcess.Call(
+			uintptr(h),
+			uintptr(common.ProcessWow64Information),
+			uintptr(unsafe.Pointer(&wow64)),
+			uintptr(unsafe.Sizeof(wow64)),
+			uintptr(0),
+		)
+		if int(ret) >= 0 {
+			if wow64 != 0 {
+				procIs32Bits = true
+			}
+		} else {
+			// if the OS does not support the call, we fallback into the bitness of the app
+			if unsafe.Sizeof(wow64) == 4 {
+				procIs32Bits = true
+			}
+		}
 
 	default:
-		//for other unknown platforms, we rely on process platform
+		// for other unknown platforms, we rely on process platform
 		if unsafe.Sizeof(processorArchitecture) == 8 {
 			procIs32Bits = false
+		} else {
+			procIs32Bits = true
 		}
 	}
+	return procIs32Bits
+}
 
-	pebAddress := queryPebAddress(syscall.Handle(h), procIs32Bits)
-	if pebAddress == 0 {
-		return "", errors.New("cannot locate process PEB")
+func getProcessEnvironmentVariables(ctx context.Context, pid int32) ([]string, error) {
+	h, err := windows.OpenProcess(processQueryInformation|windows.PROCESS_VM_READ, false, uint32(pid))
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.CloseHandle(syscall.Handle(h))
+
+	procIs32Bits := is32BitProcess(h)
+
+	var processParameterBlockAddress uint64
 
 	if procIs32Bits {
-		buf := readProcessMemory(syscall.Handle(h), procIs32Bits, pebAddress+uint64(16), 4)
-		if len(buf) != 4 {
-			return "", errors.New("cannot locate process user parameters")
+		peb, err := getUserProcessParams32(h)
+		if err != nil {
+			return nil, err
 		}
-		userProcParams := uint64(buf[0]) | (uint64(buf[1]) << 8) | (uint64(buf[2]) << 16) | (uint64(buf[3]) << 24)
+		processParameterBlockAddress = uint64(peb.EnvironmentAddress)
+	} else {
+		peb, err := getUserProcessParams64(h)
+		if err != nil {
+			return nil, err
+		}
+		processParameterBlockAddress = peb.EnvironmentAddress
+	}
+	envvarScanner := bufio.NewScanner(&processReader{
+		processHandle:  h,
+		is32BitProcess: procIs32Bits,
+		offset:         processParameterBlockAddress,
+	})
+	envvarScanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+		// Check for UTF-16 zero character
+		for i := 0; i < len(data)-1; i += 2 {
+			if data[i] == 0 && data[i+1] == 0 {
+				return i + 2, data[0:i], nil
+			}
+		}
+		if atEOF {
+			return len(data), data, nil
+		}
+		// Request more data
+		return 0, nil, nil
+	})
+	var envVars []string
+	for envvarScanner.Scan() {
+		entry := envvarScanner.Bytes()
+		if len(entry) == 0 {
+			break // Block is finished
+		}
+		envVars = append(envVars, convertUTF16ToString(entry))
+		select {
+		case <-ctx.Done():
+			break
+		default:
+			continue
+		}
+	}
+	if err := envvarScanner.Err(); err != nil {
+		return nil, err
+	}
+	return envVars, nil
+}
 
-		//read CommandLine field from PRTL_USER_PROCESS_PARAMETERS
-		remoteCmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, userProcParams+uint64(64), 8)
-		if len(remoteCmdLine) != 8 {
-			return "", errors.New("cannot read cmdline field")
+type processReader struct {
+	processHandle  windows.Handle
+	is32BitProcess bool
+	offset         uint64
+}
+
+func (p *processReader) Read(buf []byte) (int, error) {
+	processMemory := readProcessMemory(syscall.Handle(p.processHandle), p.is32BitProcess, p.offset, uint(len(buf)))
+	if len(processMemory) == 0 {
+		return 0, io.EOF
+	}
+	copy(buf, processMemory)
+	p.offset += uint64(len(processMemory))
+	return len(processMemory), nil
+}
+
+func getProcessCommandLine(pid int32) (string, error) {
+	h, err := windows.OpenProcess(processQueryInformation|windows.PROCESS_VM_READ, false, uint32(pid))
+	if err == nil {
+		defer syscall.CloseHandle(syscall.Handle(h))
+
+		cmdLine, pebErr := getProcessCommandLinePEB(h)
+		if pebErr == nil {
+			return cmdLine, nil
 		}
 
-		//remoteCmdLine is actually a UNICODE_STRING32
-		//the first two bytes has the length
-		cmdLineLength := uint(remoteCmdLine[0]) | (uint(remoteCmdLine[1]) << 8)
-		if cmdLineLength > 0 {
-			//and, at offset 4, is the pointer to the buffer
-			bufferAddress := uint32(remoteCmdLine[4]) | (uint32(remoteCmdLine[5]) << 8) |
-				(uint32(remoteCmdLine[6]) << 16) | (uint32(remoteCmdLine[7]) << 24)
+		// PEB read failed even though the handle opened. VM_READ may
+		// have been granted but ineffective against this process's
+		// protection driver. Fall back to the native query on the same handle.
+		if cmdLine, err := getProcessCommandLineNative(h, pid); err == nil {
+			return cmdLine, nil
+		}
+		return "", pebErr
+	}
 
-			cmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, uint64(bufferAddress), cmdLineLength)
-			if len(cmdLine) != int(cmdLineLength) {
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return "", nil
+	}
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return "", err
+	}
+
+	// fallback in case it's a genuine PPL process, where
+	// PROCESS_VM_READ itself is denied at OpenProcess time. Retry with
+	// just PROCESS_QUERY_LIMITED_INFORMATION, which PPL still grants.
+	lh, lerr := windows.OpenProcess(processQueryInformation, false, uint32(pid))
+	if lerr != nil {
+		return "", nil
+	}
+	defer syscall.CloseHandle(syscall.Handle(lh))
+
+	// A failure here is not an error for the caller: before this fallback
+	// existed, every ACCESS_DENIED process returned ("", nil), so the
+	// fallback can only add command lines, never take one away.
+	cmdLine, err := getProcessCommandLineNative(lh, pid)
+	if err != nil {
+		return "", nil
+	}
+	return cmdLine, nil
+}
+
+func getProcessCommandLineNative(handle windows.Handle, pid int32) (string, error) {
+	var returnLength uint32
+	// first call is to get the actual returnLength
+	err := windows.NtQueryInformationProcess(
+		handle,
+		windows.ProcessCommandLineInformation,
+		nil,
+		0,
+		&returnLength,
+	)
+	if err != nil &&
+		!errors.Is(err, windows.STATUS_INFO_LENGTH_MISMATCH) &&
+		!errors.Is(err, windows.STATUS_BUFFER_OVERFLOW) &&
+		!errors.Is(err, windows.STATUS_BUFFER_TOO_SMALL) {
+		return "", fmt.Errorf("querying command line size for pid %d: %w", pid, err)
+	}
+	if returnLength == 0 {
+		return "", fmt.Errorf("process %d returned zero-length command line info", pid)
+	}
+
+	// second call: actually fetch it into a correctly-sized buffer
+	buf := make([]byte, returnLength)
+	err = windows.NtQueryInformationProcess(
+		handle,
+		windows.ProcessCommandLineInformation,
+		unsafe.Pointer(&buf[0]),
+		returnLength,
+		&returnLength,
+	)
+	if err != nil {
+		return "", fmt.Errorf("reading command line for pid %d: %w", pid, err)
+	}
+	cmdLine, err := parseCommandLineInformation(buf)
+	if err != nil {
+		return "", fmt.Errorf("parsing command line for pid %d: %w", pid, err)
+	}
+	return cmdLine, nil
+}
+
+func getProcessCommandLinePEB(h windows.Handle) (string, error) {
+	procIs32Bits := is32BitProcess(h)
+
+	if procIs32Bits {
+		userProcParams, err := getUserProcessParams32(h)
+		if err != nil {
+			return "", err
+		}
+		if userProcParams.CommandLineLength > 0 {
+			cmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, uint64(userProcParams.CommandLineAddress), uint(userProcParams.CommandLineLength))
+			if len(cmdLine) != int(userProcParams.CommandLineLength) {
 				return "", errors.New("cannot read cmdline")
 			}
 
 			return convertUTF16ToString(cmdLine), nil
 		}
 	} else {
-		buf := readProcessMemory(syscall.Handle(h), procIs32Bits, pebAddress+uint64(32), 8)
-		if len(buf) != 8 {
-			return "", errors.New("cannot locate process user parameters")
+		userProcParams, err := getUserProcessParams64(h)
+		if err != nil {
+			return "", err
 		}
-		userProcParams := uint64(buf[0]) | (uint64(buf[1]) << 8) | (uint64(buf[2]) << 16) | (uint64(buf[3]) << 24) |
-			(uint64(buf[4]) << 32) | (uint64(buf[5]) << 40) | (uint64(buf[6]) << 48) | (uint64(buf[7]) << 56)
-
-		//read CommandLine field from PRTL_USER_PROCESS_PARAMETERS
-		remoteCmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, userProcParams+uint64(112), 16)
-		if len(remoteCmdLine) != 16 {
-			return "", errors.New("cannot read cmdline field")
-		}
-
-		//remoteCmdLine is actually a UNICODE_STRING64
-		//the first two bytes has the length
-		cmdLineLength := uint(remoteCmdLine[0]) | (uint(remoteCmdLine[1]) << 8)
-		if cmdLineLength > 0 {
-			//and, at offset 8, is the pointer to the buffer
-			bufferAddress := uint64(remoteCmdLine[8]) | (uint64(remoteCmdLine[9]) << 8) |
-				(uint64(remoteCmdLine[10]) << 16) | (uint64(remoteCmdLine[11]) << 24) |
-				(uint64(remoteCmdLine[12]) << 32) | (uint64(remoteCmdLine[13]) << 40) |
-				(uint64(remoteCmdLine[14]) << 48) | (uint64(remoteCmdLine[15]) << 56)
-
-			cmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, bufferAddress, cmdLineLength)
-			if len(cmdLine) != int(cmdLineLength) {
+		if userProcParams.CommandLineLength > 0 {
+			cmdLine := readProcessMemory(syscall.Handle(h), procIs32Bits, userProcParams.CommandLineAddress, uint(userProcParams.CommandLineLength))
+			if len(cmdLine) != int(userProcParams.CommandLineLength) {
 				return "", errors.New("cannot read cmdline")
 			}
 
@@ -876,7 +1318,7 @@ func getProcessCommandLine(pid int32) (string, error) {
 		}
 	}
 
-	//if we reach here, we have no command line
+	// if we reach here, we have no command line
 	return "", nil
 }
 
@@ -891,4 +1333,20 @@ func convertUTF16ToString(src []byte) string {
 		srcIdx += 2
 	}
 	return syscall.UTF16ToString(codePoints)
+}
+
+func parseCommandLineInformation(buf []byte) (string, error) {
+	if len(buf) < 2 {
+		return "", errors.New("command line buffer too small to read length")
+	}
+	length := binary.LittleEndian.Uint16(buf[0:2])
+	if length == 0 {
+		return "", nil
+	}
+	strOffset := int(unsafe.Sizeof(windows.NTUnicodeString{}))
+	strEnd := strOffset + int(length)
+	if strEnd > len(buf) {
+		return "", errors.New("command line length exceeds buffer size")
+	}
+	return convertUTF16ToString(buf[strOffset:strEnd]), nil
 }

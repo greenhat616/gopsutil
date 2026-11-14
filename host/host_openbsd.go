@@ -1,4 +1,5 @@
-// +build openbsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build openbsd
 
 package host
 
@@ -6,14 +7,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 	"unsafe"
 
-	"github.com/shirou/gopsutil/internal/common"
-	"github.com/shirou/gopsutil/process"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
+	"github.com/shirou/gopsutil/v4/process"
 )
 
 const (
@@ -22,7 +24,7 @@ const (
 	UTHostSize = 16
 )
 
-func HostIDWithContext(ctx context.Context) (string, error) {
+func HostIDWithContext(_ context.Context) (string, error) {
 	return "", common.ErrNotImplementedError
 }
 
@@ -34,7 +36,7 @@ func numProcs(ctx context.Context) (uint64, error) {
 	return uint64(len(procs)), nil
 }
 
-func PlatformInformationWithContext(ctx context.Context) (string, string, string, error) {
+func PlatformInformationWithContext(_ context.Context) (string, string, string, error) {
 	platform := ""
 	family := ""
 	version := ""
@@ -51,11 +53,11 @@ func PlatformInformationWithContext(ctx context.Context) (string, string, string
 	return platform, family, version, nil
 }
 
-func VirtualizationWithContext(ctx context.Context) (string, string, error) {
+func VirtualizationWithContext(_ context.Context) (string, string, error) {
 	return "", "", common.ErrNotImplementedError
 }
 
-func UsersWithContext(ctx context.Context) ([]UserStat, error) {
+func UsersWithContext(_ context.Context) ([]UserStat, error) {
 	var ret []UserStat
 	utmpfile := "/var/run/utmp"
 	file, err := os.Open(utmpfile)
@@ -64,13 +66,12 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 	}
 	defer file.Close()
 
-	buf, err := ioutil.ReadAll(file)
+	buf, err := io.ReadAll(file)
 	if err != nil {
 		return ret, err
 	}
 
-	u := Utmp{}
-	entrySize := int(unsafe.Sizeof(u))
+	entrySize := int(unsafe.Sizeof(Utmp{}))
 	count := len(buf) / entrySize
 
 	for i := 0; i < count; i++ {
@@ -78,7 +79,7 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 		var u Utmp
 		br := bytes.NewReader(b)
 		err := binary.Read(br, binary.LittleEndian, &u)
-		if err != nil || u.Time == 0 {
+		if err != nil || u.Time == 0 || u.Name[0] == 0 {
 			continue
 		}
 		user := UserStat{
@@ -92,10 +93,6 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 	}
 
 	return ret, nil
-}
-
-func SensorsTemperaturesWithContext(ctx context.Context) ([]TemperatureStat, error) {
-	return []TemperatureStat{}, common.ErrNotImplementedError
 }
 
 func KernelVersionWithContext(ctx context.Context) (string, error) {

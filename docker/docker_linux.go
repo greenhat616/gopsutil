@@ -1,19 +1,26 @@
-// +build linux
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build linux
 
 package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
-	cpu "github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
+
+// microseconds is the unit of the counters in the cgroup v2 cpu.stat file.
+const microseconds = 1e6
 
 // GetDockerStat returns a list of Docker basic stats.
 // This requires certain permission.
@@ -22,13 +29,11 @@ func GetDockerStat() ([]CgroupDockerStat, error) {
 }
 
 func GetDockerStatWithContext(ctx context.Context) ([]CgroupDockerStat, error) {
-	path, err := exec.LookPath("docker")
+	out, err := invoke.CommandWithContext(ctx, "docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}|{{.Image}}|{{.Names}}|{{.Status}}")
 	if err != nil {
-		return nil, ErrDockerNotAvailable
-	}
-
-	out, err := invoke.CommandWithContext(ctx, path, "ps", "-a", "--no-trunc", "--format", "{{.ID}}|{{.Image}}|{{.Names}}|{{.Status}}")
-	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, ErrDockerNotAvailable
+		}
 		return []CgroupDockerStat{}, err
 	}
 	lines := strings.Split(string(out), "\n")
@@ -56,20 +61,18 @@ func GetDockerStatWithContext(ctx context.Context) ([]CgroupDockerStat, error) {
 	return ret, nil
 }
 
-// GetDockerIDList returnes a list of DockerID.
+// GetDockerIDList returns a list of DockerID.
 // This requires certain permission.
 func GetDockerIDList() ([]string, error) {
 	return GetDockerIDListWithContext(context.Background())
 }
 
 func GetDockerIDListWithContext(ctx context.Context) ([]string, error) {
-	path, err := exec.LookPath("docker")
+	out, err := invoke.CommandWithContext(ctx, "docker", "ps", "-q", "--no-trunc")
 	if err != nil {
-		return nil, ErrDockerNotAvailable
-	}
-
-	out, err := invoke.CommandWithContext(ctx, path, "ps", "-q", "--no-trunc")
-	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, ErrDockerNotAvailable
+		}
 		return []string{}, err
 	}
 	lines := strings.Split(string(out), "\n")
@@ -85,33 +88,47 @@ func GetDockerIDListWithContext(ctx context.Context) ([]string, error) {
 	return ret, nil
 }
 
-// CgroupCPU returnes specified cgroup id CPU status.
+// CgroupCPU returns specified cgroup id CPU status.
 // containerID is same as docker id if you use docker.
 // If you use container via systemd.slice, you could use
 // containerID = docker-<container id>.scope and base=/sys/fs/cgroup/cpuacct/system.slice/
-func CgroupCPU(containerID string, base string) (*cpu.TimesStat, error) {
+// on cgroup v1 or base=/sys/fs/cgroup/system.slice/ on cgroup v2.
+// The cgroup hierarchy (v1 or v2) is detected automatically through
+// /sys/fs/cgroup/cgroup.controllers.
+func CgroupCPU(containerID, base string) (*CgroupCPUStat, error) {
 	return CgroupCPUWithContext(context.Background(), containerID, base)
 }
 
-// CgroupCPUUsage returnes specified cgroup id CPU usage.
+// CgroupCPUUsage returns specified cgroup id CPU usage.
 // containerID is same as docker id if you use docker.
 // If you use container via systemd.slice, you could use
 // containerID = docker-<container id>.scope and base=/sys/fs/cgroup/cpuacct/system.slice/
-func CgroupCPUUsage(containerID string, base string) (float64, error) {
+// on cgroup v1 or base=/sys/fs/cgroup/system.slice/ on cgroup v2.
+// The cgroup hierarchy (v1 or v2) is detected automatically through
+// /sys/fs/cgroup/cgroup.controllers.
+func CgroupCPUUsage(containerID, base string) (float64, error) {
 	return CgroupCPUUsageWithContext(context.Background(), containerID, base)
 }
 
-func CgroupCPUWithContext(ctx context.Context, containerID string, base string) (*cpu.TimesStat, error) {
-	statfile := getCgroupFilePath(containerID, base, "cpuacct", "cpuacct.stat")
+func CgroupCPUWithContext(ctx context.Context, containerID, base string) (*CgroupCPUStat, error) {
+	if isCgroupV2(ctx) {
+		return cgroupCPUV2WithContext(ctx, containerID, base)
+	}
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "cpuacct", "cpuacct.stat")
+	if err != nil {
+		return nil, err
+	}
 	lines, err := common.ReadLines(statfile)
 	if err != nil {
 		return nil, err
 	}
+
+	ret := &CgroupCPUStat{}
+	ret.CPU = containerID
 	// empty containerID means all cgroup
-	if len(containerID) == 0 {
-		containerID = "all"
+	if containerID == "" {
+		ret.CPU = "all"
 	}
-	ret := &cpu.TimesStat{CPU: containerID}
 	for _, line := range lines {
 		fields := strings.Split(line, " ")
 		if fields[0] == "user" {
@@ -127,11 +144,26 @@ func CgroupCPUWithContext(ctx context.Context, containerID string, base string) 
 			}
 		}
 	}
+	usage, err := CgroupCPUUsageWithContext(ctx, containerID, base)
+	if err != nil {
+		return nil, err
+	}
+	ret.Usage = usage
 	return ret, nil
 }
 
 func CgroupCPUUsageWithContext(ctx context.Context, containerID, base string) (float64, error) {
-	usagefile := getCgroupFilePath(containerID, base, "cpuacct", "cpuacct.usage")
+	if isCgroupV2(ctx) {
+		stat, err := cgroupCPUV2WithContext(ctx, containerID, base)
+		if err != nil {
+			return 0.0, err
+		}
+		return stat.Usage, nil
+	}
+	usagefile, err := getCgroupFilePath(ctx, containerID, base, "cpuacct", "cpuacct.usage")
+	if err != nil {
+		return 0.0, err
+	}
 	lines, err := common.ReadLinesOffsetN(usagefile, 0, 1)
 	if err != nil {
 		return 0.0, err
@@ -145,38 +177,74 @@ func CgroupCPUUsageWithContext(ctx context.Context, containerID, base string) (f
 	return ns / nanoseconds, nil
 }
 
-func CgroupCPUDocker(containerid string) (*cpu.TimesStat, error) {
-	return CgroupCPUDockerWithContext(context.Background(), containerid)
+func CgroupCPUDocker(containerID string) (*CgroupCPUStat, error) {
+	return CgroupCPUDockerWithContext(context.Background(), containerID)
 }
 
-func CgroupCPUUsageDocker(containerid string) (float64, error) {
-	return CgroupCPUDockerUsageWithContext(context.Background(), containerid)
+func CgroupCPUUsageDocker(containerID string) (float64, error) {
+	return CgroupCPUDockerUsageWithContext(context.Background(), containerID)
 }
 
-func CgroupCPUDockerWithContext(ctx context.Context, containerid string) (*cpu.TimesStat, error) {
-	return CgroupCPU(containerid, common.HostSys("fs/cgroup/cpuacct/docker"))
+func CgroupCPUDockerWithContext(ctx context.Context, containerID string) (*CgroupCPUStat, error) {
+	// An empty base lets getCgroupFilePath pick the docker directory of the
+	// detected cgroup hierarchy (/sys/fs/cgroup/cpuacct/docker on v1).
+	return CgroupCPUWithContext(ctx, containerID, "")
 }
 
-func CgroupCPUDockerUsageWithContext(ctx context.Context, containerid string) (float64, error) {
-	return CgroupCPUUsage(containerid, common.HostSys("fs/cgroup/cpuacct/docker"))
+func CgroupCPUDockerUsageWithContext(ctx context.Context, containerID string) (float64, error) {
+	return CgroupCPUUsageWithContext(ctx, containerID, "")
 }
 
-func CgroupMem(containerID string, base string) (*CgroupMemStat, error) {
+// CgroupCPUOwn returns the CPU status of the cgroup the calling process
+// belongs to. Unlike CgroupCPUDocker it needs no container ID, so it works
+// from inside a container that cannot see its own cgroup name, which is the
+// default for docker on cgroup v2. The CPU field of the result is "own".
+func CgroupCPUOwn() (*CgroupCPUStat, error) {
+	return CgroupCPUOwnWithContext(context.Background())
+}
+
+func CgroupCPUOwnWithContext(ctx context.Context) (*CgroupCPUStat, error) {
+	base, err := cgroupOwnDir(ctx, "cpuacct")
+	if err != nil {
+		return nil, err
+	}
+	ret, err := CgroupCPUWithContext(ctx, "", base)
+	if err != nil {
+		return nil, err
+	}
+	ret.CPU = "own"
+	return ret, nil
+}
+
+// CgroupMem returns specified cgroup id memory status.
+// containerID is same as docker id if you use docker.
+// If you use container via systemd.slice, you could use
+// containerID = docker-<container id>.scope and base=/sys/fs/cgroup/memory/system.slice/
+// on cgroup v1 or base=/sys/fs/cgroup/system.slice/ on cgroup v2.
+// The cgroup hierarchy (v1 or v2) is detected automatically through
+// /sys/fs/cgroup/cgroup.controllers.
+func CgroupMem(containerID, base string) (*CgroupMemStat, error) {
 	return CgroupMemWithContext(context.Background(), containerID, base)
 }
 
-func CgroupMemWithContext(ctx context.Context, containerID string, base string) (*CgroupMemStat, error) {
-	statfile := getCgroupFilePath(containerID, base, "memory", "memory.stat")
-
-	// empty containerID means all cgroup
-	if len(containerID) == 0 {
-		containerID = "all"
+func CgroupMemWithContext(ctx context.Context, containerID, base string) (*CgroupMemStat, error) {
+	if isCgroupV2(ctx) {
+		return cgroupMemV2WithContext(ctx, containerID, base)
 	}
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "memory", "memory.stat")
+	if err != nil {
+		return nil, err
+	}
+
 	lines, err := common.ReadLines(statfile)
 	if err != nil {
 		return nil, err
 	}
 	ret := &CgroupMemStat{ContainerID: containerID}
+	// empty containerID means all cgroup
+	if containerID == "" {
+		ret.ContainerID = "all"
+	}
 	for _, line := range lines {
 		fields := strings.Split(line, " ")
 		v, err := strconv.ParseUint(fields[1], 10, 64)
@@ -188,9 +256,9 @@ func CgroupMemWithContext(ctx context.Context, containerID string, base string) 
 			ret.Cache = v
 		case "rss":
 			ret.RSS = v
-		case "rssHuge":
+		case "rssHuge", "rss_huge":
 			ret.RSSHuge = v
-		case "mappedFile":
+		case "mappedFile", "mapped_file":
 			ret.MappedFile = v
 		case "pgpgin":
 			ret.Pgpgin = v
@@ -241,19 +309,19 @@ func CgroupMemWithContext(ctx context.Context, containerID string, base string) 
 		}
 	}
 
-	r, err := getCgroupMemFile(containerID, base, "memory.usage_in_bytes")
+	r, err := getCgroupMemFile(ctx, containerID, base, "memory.usage_in_bytes")
 	if err == nil {
 		ret.MemUsageInBytes = r
 	}
-	r, err = getCgroupMemFile(containerID, base, "memory.max_usage_in_bytes")
+	r, err = getCgroupMemFile(ctx, containerID, base, "memory.max_usage_in_bytes")
 	if err == nil {
 		ret.MemMaxUsageInBytes = r
 	}
-	r, err = getCgroupMemFile(containerID, base, "memoryLimitInBbytes")
+	r, err = getCgroupMemFile(ctx, containerID, base, "memory.limit_in_bytes")
 	if err == nil {
 		ret.MemLimitInBytes = r
 	}
-	r, err = getCgroupMemFile(containerID, base, "memoryFailcnt")
+	r, err = getCgroupMemFile(ctx, containerID, base, "memory.failcnt")
 	if err == nil {
 		ret.MemFailCnt = r
 	}
@@ -266,27 +334,308 @@ func CgroupMemDocker(containerID string) (*CgroupMemStat, error) {
 }
 
 func CgroupMemDockerWithContext(ctx context.Context, containerID string) (*CgroupMemStat, error) {
-	return CgroupMem(containerID, common.HostSys("fs/cgroup/memory/docker"))
+	// An empty base lets getCgroupFilePath pick the docker directory of the
+	// detected cgroup hierarchy (/sys/fs/cgroup/memory/docker on v1).
+	return CgroupMemWithContext(ctx, containerID, "")
+}
+
+// CgroupMemOwn returns the memory status of the cgroup the calling process
+// belongs to. Unlike CgroupMemDocker it needs no container ID, so it works
+// from inside a container that cannot see its own cgroup name, which is the
+// default for docker on cgroup v2. The ContainerID of the result is "own".
+func CgroupMemOwn() (*CgroupMemStat, error) {
+	return CgroupMemOwnWithContext(context.Background())
+}
+
+func CgroupMemOwnWithContext(ctx context.Context) (*CgroupMemStat, error) {
+	base, err := cgroupOwnDir(ctx, "memory")
+	if err != nil {
+		return nil, err
+	}
+	ret, err := CgroupMemWithContext(ctx, "", base)
+	if err != nil {
+		return nil, err
+	}
+	ret.ContainerID = "own"
+	return ret, nil
+}
+
+// cgroupMemV2WithContext reads the memory statistics of a cgroup on the
+// cgroup v2 unified hierarchy and maps them onto CgroupMemStat, whose
+// fields follow the cgroup v1 naming:
+//
+//   - memory.current -> MemUsageInBytes
+//   - memory.peak -> MemMaxUsageInBytes (Linux 5.19+, stays 0 when the file
+//     is absent)
+//   - memory.max -> MemLimitInBytes; the literal "max" (no limit) is reported
+//     as math.MaxUint64, whereas cgroup v1 reports the kernel sentinel
+//     9223372036854771712 for an unlimited cgroup
+//   - memory.events "max" -> MemFailCnt, the number of times the usage hit
+//     the limit, which is the closest equivalent of the v1 failcnt
+//   - memory.stat anon -> RSS, file -> Cache, anon_thp -> RSSHuge,
+//     file_mapped -> MappedFile, pgfault -> Pgfault, pgmajfault -> Pgmajfault
+//     and inactive_anon, active_anon, inactive_file, active_file, unevictable
+//     -> the same-named fields. cgroup v2 counters are hierarchical, so the
+//     corresponding Total* fields carry the same values.
+//
+// Pgpgin, Pgpgout and HierarchicalMemoryLimit have no cgroup v2 equivalent
+// and are left at 0.
+func cgroupMemV2WithContext(ctx context.Context, containerID, base string) (*CgroupMemStat, error) {
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "memory", "memory.stat")
+	if err != nil {
+		return nil, err
+	}
+	lines, err := common.ReadLines(statfile)
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &CgroupMemStat{ContainerID: containerID}
+	// empty containerID means all cgroup
+	if containerID == "" {
+		ret.ContainerID = "all"
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "anon":
+			ret.RSS, ret.TotalRSS = v, v
+		case "file":
+			ret.Cache, ret.TotalCache = v, v
+		case "anon_thp":
+			ret.RSSHuge, ret.TotalRSSHuge = v, v
+		case "file_mapped":
+			ret.MappedFile, ret.TotalMappedFile = v, v
+		case "pgfault":
+			ret.Pgfault, ret.TotalPgFault = v, v
+		case "pgmajfault":
+			ret.Pgmajfault, ret.TotalPgMajFault = v, v
+		case "inactive_anon":
+			ret.InactiveAnon, ret.TotalInactiveAnon = v, v
+		case "active_anon":
+			ret.ActiveAnon, ret.TotalActiveAnon = v, v
+		case "inactive_file":
+			ret.InactiveFile, ret.TotalInactiveFile = v, v
+		case "active_file":
+			ret.ActiveFile, ret.TotalActiveFile = v, v
+		case "unevictable":
+			ret.Unevictable, ret.TotalUnevictable = v, v
+		}
+	}
+
+	r, err := getCgroupMemFileV2(ctx, containerID, base, "memory.current")
+	if err == nil {
+		ret.MemUsageInBytes = r
+	}
+	r, err = getCgroupMemFileV2(ctx, containerID, base, "memory.peak")
+	if err == nil {
+		ret.MemMaxUsageInBytes = r
+	}
+	r, err = getCgroupMemFileV2(ctx, containerID, base, "memory.max")
+	if err == nil {
+		ret.MemLimitInBytes = r
+	}
+	r, err = getCgroupMemFailCntV2(ctx, containerID, base)
+	if err == nil {
+		ret.MemFailCnt = r
+	}
+
+	return ret, nil
+}
+
+// cgroupCPUV2WithContext reads the CPU statistics of a cgroup on the cgroup
+// v2 unified hierarchy from cpu.stat. usage_usec, user_usec and system_usec
+// are converted to seconds, the same unit the cgroup v1 reader produces.
+func cgroupCPUV2WithContext(ctx context.Context, containerID, base string) (*CgroupCPUStat, error) {
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "cpu", "cpu.stat")
+	if err != nil {
+		return nil, err
+	}
+	lines, err := common.ReadLines(statfile)
+	if err != nil {
+		return nil, err
+	}
+	// empty containerID means all cgroup
+	if containerID == "" {
+		containerID = "all"
+	}
+
+	ret := &CgroupCPUStat{}
+	ret.CPU = containerID
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "usage_usec":
+			ret.Usage = v / microseconds
+		case "user_usec":
+			ret.User = v / microseconds
+		case "system_usec":
+			ret.System = v / microseconds
+		}
+	}
+	return ret, nil
+}
+
+// isCgroupV2 reports whether the host mounts the cgroup v2 unified hierarchy
+// at /sys/fs/cgroup. The hybrid layout (v1 controllers plus a "unified"
+// subtree) has no cgroup.controllers file at the root and is treated as v1.
+// The result is deliberately not cached so that HOST_SYS and per-context
+// environment overrides are honoured on every call.
+func isCgroupV2(ctx context.Context) bool {
+	return common.PathExists(common.HostSysWithContext(ctx, "fs/cgroup/cgroup.controllers"))
+}
+
+// cgroupDir returns the host path of dir inside the cgroup tree. On cgroup v2
+// there is a single unified tree (/sys/fs/cgroup/<dir>), on cgroup v1 each
+// controller has its own tree (/sys/fs/cgroup/<target>/<dir>).
+func cgroupDir(ctx context.Context, v2 bool, target, dir string) string {
+	if v2 {
+		return common.HostSysWithContext(ctx, "fs/cgroup", dir)
+	}
+	return common.HostSysWithContext(ctx, "fs/cgroup", target, dir)
+}
+
+// cgroupOwnDir returns the cgroup directory of the calling process. target
+// selects the cgroup v1 controller and is ignored on cgroup v2, which has a
+// single unified hierarchy.
+//
+// The path in /proc/self/cgroup is relative to the cgroup root of the host.
+// Joining it onto the local cgroup root resolves the directory on a host, and
+// inside a container that shares the host cgroup namespace. A container with
+// its own cgroup namespace sees its cgroup as the root, so the joined path
+// does not exist and the root itself is the answer. The same fallback covers
+// docker on cgroup v1, which mounts the container directory at
+// /sys/fs/cgroup/<controller> inside the container.
+func cgroupOwnDir(ctx context.Context, target string) (string, error) {
+	v2 := isCgroupV2(ctx)
+	root := common.HostSysWithContext(ctx, "fs/cgroup")
+	if !v2 {
+		root = path.Join(root, target)
+	}
+	procfile := common.HostProcWithContext(ctx, "self/cgroup")
+	lines, err := common.ReadLines(procfile)
+	if err != nil {
+		return "", err
+	}
+	rel, err := ownCgroupPath(lines, v2, target)
+	if err != nil {
+		return "", fmt.Errorf("%w in %s", err, procfile)
+	}
+	if dir := path.Join(root, rel); common.PathExists(dir) {
+		return dir, nil
+	}
+	return root, nil
+}
+
+// ownCgroupPath picks the cgroup path of the calling process out of the
+// lines of /proc/self/cgroup. Every line is "hierarchyID:controllers:path".
+// The cgroup v2 entry has hierarchy ID 0 and an empty controller list, a
+// cgroup v1 entry lists its controllers separated by commas.
+func ownCgroupPath(lines []string, v2 bool, target string) (string, error) {
+	for _, line := range lines {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		if v2 {
+			if fields[0] == "0" {
+				return fields[2], nil
+			}
+			continue
+		}
+		if slices.Contains(strings.Split(fields[1], ","), target) {
+			return fields[2], nil
+		}
+	}
+	return "", fmt.Errorf("no cgroup entry for %q", target)
 }
 
 // getCgroupFilePath constructs file path to get targeted stats file.
-func getCgroupFilePath(containerID, base, target, file string) string {
-	if len(base) == 0 {
-		base = common.HostSys(fmt.Sprintf("fs/cgroup/%s/docker", target))
+// When base is empty the docker directory of the detected cgroup hierarchy
+// is used (cgroupfs driver layout). When the container directory does not
+// exist under base, the systemd driver layout
+// (system.slice/docker-<containerID>.scope) is tried instead.
+func getCgroupFilePath(ctx context.Context, containerID, base, target, file string) (string, error) {
+	// Prevent a caller-supplied containerID from escaping the cgroup base
+	// directory via path separators or ".." traversal.
+	if strings.ContainsAny(containerID, `/\`) || strings.Contains(containerID, "..") {
+		return "", fmt.Errorf("invalid container ID %q", containerID)
+	}
+	v2 := isCgroupV2(ctx)
+	if base == "" {
+		base = cgroupDir(ctx, v2, target, "docker")
 	}
 	statfile := path.Join(base, containerID, file)
 
 	if _, err := os.Stat(statfile); os.IsNotExist(err) {
-		statfile = path.Join(
-			common.HostSys(fmt.Sprintf("fs/cgroup/%s/system.slice", target)), "docker-"+containerID+".scope", file)
+		statfile = path.Join(cgroupDir(ctx, v2, target, "system.slice"), "docker-"+containerID+".scope", file)
 	}
 
-	return statfile
+	return statfile, nil
+}
+
+// getCgroupMemFileV2 reads a single-value cgroup v2 memory file and returns
+// the contents as uint64. The literal "max" (no limit) is returned as
+// math.MaxUint64.
+func getCgroupMemFileV2(ctx context.Context, containerID, base, file string) (uint64, error) {
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "memory", file)
+	if err != nil {
+		return 0, err
+	}
+	lines, err := common.ReadLines(statfile)
+	if err != nil {
+		return 0, err
+	}
+	if len(lines) != 1 {
+		return 0, fmt.Errorf("wrong format file: %s", statfile)
+	}
+	value := strings.TrimSpace(lines[0])
+	if value == "max" {
+		return math.MaxUint64, nil
+	}
+	return strconv.ParseUint(value, 10, 64)
+}
+
+// getCgroupMemFailCntV2 returns the "max" counter of memory.events, i.e. the
+// number of times the memory usage of the cgroup hit its limit.
+func getCgroupMemFailCntV2(ctx context.Context, containerID, base string) (uint64, error) {
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "memory", "memory.events")
+	if err != nil {
+		return 0, err
+	}
+	lines, err := common.ReadLines(statfile)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "max" {
+			return strconv.ParseUint(fields[1], 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("no max event in %s", statfile)
 }
 
 // getCgroupMemFile reads a cgroup file and return the contents as uint64.
-func getCgroupMemFile(containerID, base, file string) (uint64, error) {
-	statfile := getCgroupFilePath(containerID, base, "memory", file)
+func getCgroupMemFile(ctx context.Context, containerID, base, file string) (uint64, error) {
+	statfile, err := getCgroupFilePath(ctx, containerID, base, "memory", file)
+	if err != nil {
+		return 0, err
+	}
 	lines, err := common.ReadLines(statfile)
 	if err != nil {
 		return 0, err

@@ -1,12 +1,12 @@
-// +build !linux
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build !linux
 
 package docker
 
 import (
 	"context"
 
-	cpu "github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 // GetDockerStat returns a list of Docker basic stats.
@@ -15,52 +15,86 @@ func GetDockerStat() ([]CgroupDockerStat, error) {
 	return GetDockerStatWithContext(context.Background())
 }
 
-func GetDockerStatWithContext(ctx context.Context) ([]CgroupDockerStat, error) {
+func GetDockerStatWithContext(_ context.Context) ([]CgroupDockerStat, error) {
 	return nil, ErrDockerNotAvailable
 }
 
-// GetDockerIDList returnes a list of DockerID.
+// GetDockerIDList returns a list of DockerID.
 // This requires certain permission.
 func GetDockerIDList() ([]string, error) {
 	return GetDockerIDListWithContext(context.Background())
 }
 
-func GetDockerIDListWithContext(ctx context.Context) ([]string, error) {
+func GetDockerIDListWithContext(_ context.Context) ([]string, error) {
 	return nil, ErrDockerNotAvailable
 }
 
-// CgroupCPU returnes specified cgroup id CPU status.
-// containerid is same as docker id if you use docker.
+// CgroupCPU returns specified cgroup id CPU status.
+// containerID is same as docker id if you use docker.
 // If you use container via systemd.slice, you could use
-// containerid = docker-<container id>.scope and base=/sys/fs/cgroup/cpuacct/system.slice/
-func CgroupCPU(containerid string, base string) (*cpu.TimesStat, error) {
-	return CgroupCPUWithContext(context.Background(), containerid, base)
+// containerID = docker-<container id>.scope and base=/sys/fs/cgroup/cpuacct/system.slice/
+// on cgroup v1 or base=/sys/fs/cgroup/system.slice/ on cgroup v2.
+// The cgroup hierarchy (v1 or v2) is detected automatically through
+// /sys/fs/cgroup/cgroup.controllers.
+func CgroupCPU(containerID, base string) (*CgroupCPUStat, error) {
+	return CgroupCPUWithContext(context.Background(), containerID, base)
 }
 
-func CgroupCPUWithContext(ctx context.Context, containerid string, base string) (*cpu.TimesStat, error) {
+func CgroupCPUWithContext(_ context.Context, _, _ string) (*CgroupCPUStat, error) {
 	return nil, ErrCgroupNotAvailable
 }
 
-func CgroupCPUDocker(containerid string) (*cpu.TimesStat, error) {
-	return CgroupCPUDockerWithContext(context.Background(), containerid)
+func CgroupCPUDocker(containerID string) (*CgroupCPUStat, error) {
+	return CgroupCPUDockerWithContext(context.Background(), containerID)
 }
 
-func CgroupCPUDockerWithContext(ctx context.Context, containerid string) (*cpu.TimesStat, error) {
-	return CgroupCPU(containerid, common.HostSys("fs/cgroup/cpuacct/docker"))
+func CgroupCPUDockerWithContext(ctx context.Context, containerID string) (*CgroupCPUStat, error) {
+	return CgroupCPUWithContext(ctx, containerID, common.HostSysWithContext(ctx, "fs/cgroup/cpuacct/docker"))
 }
 
-func CgroupMem(containerid string, base string) (*CgroupMemStat, error) {
-	return CgroupMemWithContext(context.Background(), containerid, base)
+// CgroupCPUOwn returns the CPU status of the cgroup the calling process
+// belongs to. Unlike CgroupCPUDocker it needs no container ID, so it works
+// from inside a container that cannot see its own cgroup name, which is the
+// default for docker on cgroup v2. The CPU field of the result is "own".
+func CgroupCPUOwn() (*CgroupCPUStat, error) {
+	return CgroupCPUOwnWithContext(context.Background())
 }
 
-func CgroupMemWithContext(ctx context.Context, containerid string, base string) (*CgroupMemStat, error) {
+func CgroupCPUOwnWithContext(_ context.Context) (*CgroupCPUStat, error) {
 	return nil, ErrCgroupNotAvailable
 }
 
-func CgroupMemDocker(containerid string) (*CgroupMemStat, error) {
-	return CgroupMemDockerWithContext(context.Background(), containerid)
+// CgroupMem returns specified cgroup id memory status.
+// containerID is same as docker id if you use docker.
+// If you use container via systemd.slice, you could use
+// containerID = docker-<container id>.scope and base=/sys/fs/cgroup/memory/system.slice/
+// on cgroup v1 or base=/sys/fs/cgroup/system.slice/ on cgroup v2.
+// The cgroup hierarchy (v1 or v2) is detected automatically through
+// /sys/fs/cgroup/cgroup.controllers.
+func CgroupMem(containerID, base string) (*CgroupMemStat, error) {
+	return CgroupMemWithContext(context.Background(), containerID, base)
 }
 
-func CgroupMemDockerWithContext(ctx context.Context, containerid string) (*CgroupMemStat, error) {
-	return CgroupMem(containerid, common.HostSys("fs/cgroup/memory/docker"))
+func CgroupMemWithContext(_ context.Context, _, _ string) (*CgroupMemStat, error) {
+	return nil, ErrCgroupNotAvailable
+}
+
+func CgroupMemDocker(containerID string) (*CgroupMemStat, error) {
+	return CgroupMemDockerWithContext(context.Background(), containerID)
+}
+
+func CgroupMemDockerWithContext(ctx context.Context, containerID string) (*CgroupMemStat, error) {
+	return CgroupMemWithContext(ctx, containerID, common.HostSysWithContext(ctx, "fs/cgroup/memory/docker"))
+}
+
+// CgroupMemOwn returns the memory status of the cgroup the calling process
+// belongs to. Unlike CgroupMemDocker it needs no container ID, so it works
+// from inside a container that cannot see its own cgroup name, which is the
+// default for docker on cgroup v2. The ContainerID of the result is "own".
+func CgroupMemOwn() (*CgroupMemStat, error) {
+	return CgroupMemOwnWithContext(context.Background())
+}
+
+func CgroupMemOwnWithContext(_ context.Context) (*CgroupMemStat, error) {
+	return nil, ErrCgroupNotAvailable
 }

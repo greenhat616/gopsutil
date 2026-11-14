@@ -1,9 +1,11 @@
-// +build linux freebsd darwin openbsd
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build linux || freebsd || darwin || openbsd
 
 package common
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,12 +19,11 @@ func CallLsofWithContext(ctx context.Context, invoke Invoker, pid int32, args ..
 		cmd = []string{"-a", "-n", "-P", "-p", strconv.Itoa(int(pid))}
 	}
 	cmd = append(cmd, args...)
-	lsof, err := exec.LookPath("lsof")
+	out, err := invoke.CommandWithContext(ctx, "lsof", cmd...)
 	if err != nil {
-		return []string{}, err
-	}
-	out, err := invoke.CommandWithContext(ctx, lsof, cmd...)
-	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return []string{}, err
+		}
 		// if no pid found, lsof returns code 1.
 		if err.Error() == "exit status 1" && len(out) == 0 {
 			return []string{}, nil
@@ -32,36 +33,10 @@ func CallLsofWithContext(ctx context.Context, invoke Invoker, pid int32, args ..
 
 	var ret []string
 	for _, l := range lines[1:] {
-		if len(l) == 0 {
+		if l == "" {
 			continue
 		}
 		ret = append(ret, l)
-	}
-	return ret, nil
-}
-
-func CallPgrepWithContext(ctx context.Context, invoke Invoker, pid int32) ([]int32, error) {
-	var cmd []string
-	cmd = []string{"-P", strconv.Itoa(int(pid))}
-	pgrep, err := exec.LookPath("pgrep")
-	if err != nil {
-		return []int32{}, err
-	}
-	out, err := invoke.CommandWithContext(ctx, pgrep, cmd...)
-	if err != nil {
-		return []int32{}, err
-	}
-	lines := strings.Split(string(out), "\n")
-	ret := make([]int32, 0, len(lines))
-	for _, l := range lines {
-		if len(l) == 0 {
-			continue
-		}
-		i, err := strconv.Atoi(l)
-		if err != nil {
-			continue
-		}
-		ret = append(ret, int32(i))
 	}
 	return ret, nil
 }

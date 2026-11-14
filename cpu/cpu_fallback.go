@@ -1,4 +1,5 @@
-// +build !darwin,!linux,!freebsd,!openbsd,!solaris,!windows,!dragonfly
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build !darwin && !linux && !freebsd && !openbsd && !netbsd && !solaris && !windows && !dragonfly && !plan9 && !aix
 
 package cpu
 
@@ -6,7 +7,7 @@ import (
 	"context"
 	"runtime"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 func Times(percpu bool) ([]TimesStat, error) {

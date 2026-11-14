@@ -1,22 +1,22 @@
-// +build windows
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build windows
 
 package load
 
 import (
 	"context"
-	"log"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
 var (
 	loadErr              error
-	loadAvg1M            float64 = 0.0
-	loadAvg5M            float64 = 0.0
-	loadAvg15M           float64 = 0.0
+	loadAvg1M            = 0.0
+	loadAvg5M            = 0.0
+	loadAvg15M           = 0.0
 	loadAvgMutex         sync.RWMutex
 	loadAvgGoroutineOnce sync.Once
 )
@@ -25,23 +25,23 @@ var (
 // TODO instead of this goroutine, we can register a Win32 counter just as psutil does
 // see https://psutil.readthedocs.io/en/latest/#psutil.getloadavg
 // code https://github.com/giampaolo/psutil/blob/8415355c8badc9c94418b19bdf26e622f06f0cce/psutil/arch/windows/wmi.c
-func loadAvgGoroutine() {
+func loadAvgGoroutine(ctx context.Context) {
 	var (
-		samplingFrequency time.Duration = 5 * time.Second
-		loadAvgFactor1M   float64       = 1 / math.Exp(samplingFrequency.Seconds()/time.Minute.Seconds())
-		loadAvgFactor5M   float64       = 1 / math.Exp(samplingFrequency.Seconds()/(5*time.Minute).Seconds())
-		loadAvgFactor15M  float64       = 1 / math.Exp(samplingFrequency.Seconds()/(15*time.Minute).Seconds())
+		samplingFrequency = 5 * time.Second
+		loadAvgFactor1M   = 1 / math.Exp(samplingFrequency.Seconds()/time.Minute.Seconds())
+		loadAvgFactor5M   = 1 / math.Exp(samplingFrequency.Seconds()/(5*time.Minute).Seconds())
+		loadAvgFactor15M  = 1 / math.Exp(samplingFrequency.Seconds()/(15*time.Minute).Seconds())
 		currentLoad       float64
 	)
 
 	counter, err := common.ProcessorQueueLengthCounter()
 	if err != nil || counter == nil {
-		log.Println("gopsutil: unexpected processor queue length counter error, please file an issue on github: err")
 		return
 	}
 
 	tick := time.NewTicker(samplingFrequency).C
-	for {
+
+	f := func() {
 		currentLoad, err = counter.GetValue()
 		loadAvgMutex.Lock()
 		loadErr = err
@@ -49,7 +49,16 @@ func loadAvgGoroutine() {
 		loadAvg5M = loadAvg5M*loadAvgFactor5M + currentLoad*(1-loadAvgFactor5M)
 		loadAvg15M = loadAvg15M*loadAvgFactor15M + currentLoad*(1-loadAvgFactor15M)
 		loadAvgMutex.Unlock()
-		<-tick
+	}
+
+	f() // run first time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+			f()
+		}
 	}
 }
 
@@ -60,7 +69,7 @@ func Avg() (*AvgStat, error) {
 
 func AvgWithContext(ctx context.Context) (*AvgStat, error) {
 	loadAvgGoroutineOnce.Do(func() {
-		go loadAvgGoroutine()
+		go loadAvgGoroutine(ctx)
 	})
 	loadAvgMutex.RLock()
 	defer loadAvgMutex.RUnlock()
@@ -77,7 +86,7 @@ func Misc() (*MiscStat, error) {
 	return MiscWithContext(context.Background())
 }
 
-func MiscWithContext(ctx context.Context) (*MiscStat, error) {
+func MiscWithContext(_ context.Context) (*MiscStat, error) {
 	ret := MiscStat{}
 
 	return &ret, common.ErrNotImplementedError

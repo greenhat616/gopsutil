@@ -1,10 +1,10 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package cpu
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"runtime"
 	"sort"
@@ -24,7 +24,7 @@ func init() {
 	}
 }
 
-//sum all values in a float64 map with float64 keys
+// sum all values in a float64 map with float64 keys
 func msum(x map[float64]float64) float64 {
 	total := 0.0
 	for _, y := range x {
@@ -37,54 +37,51 @@ func Times(percpu bool) ([]TimesStat, error) {
 	return TimesWithContext(context.Background(), percpu)
 }
 
+var kstatSplit = regexp.MustCompile(`[:\s]+`)
+
 func TimesWithContext(ctx context.Context, percpu bool) ([]TimesStat, error) {
-	kstatSys, err := exec.LookPath("kstat")
+	kstatSysOut, err := invoke.CommandWithContext(ctx, "kstat", "-p", "cpu_stat:*:*:/^idle$|^user$|^kernel$|^iowait$|^swap$/")
 	if err != nil {
-		return nil, fmt.Errorf("cannot find kstat: %s", err)
+		return nil, fmt.Errorf("cannot execute kstat: %w", err)
 	}
 	cpu := make(map[float64]float64)
 	idle := make(map[float64]float64)
 	user := make(map[float64]float64)
 	kern := make(map[float64]float64)
 	iowt := make(map[float64]float64)
-	//swap := make(map[float64]float64)
-	kstatSysOut, err := invoke.CommandWithContext(ctx, kstatSys, "-p", "cpu_stat:*:*:/^idle$|^user$|^kernel$|^iowait$|^swap$/")
-	if err != nil {
-		return nil, fmt.Errorf("cannot execute kstat: %s", err)
-	}
-	re := regexp.MustCompile(`[:\s]+`)
+	// swap := make(map[float64]float64)
 	for _, line := range strings.Split(string(kstatSysOut), "\n") {
-		fields := re.Split(line, -1)
+		fields := kstatSplit.Split(line, -1)
 		if fields[0] != "cpu_stat" {
 			continue
 		}
 		cpuNumber, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse cpu number: %s", err)
+			return nil, fmt.Errorf("cannot parse cpu number: %w", err)
 		}
 		cpu[cpuNumber] = cpuNumber
 		switch fields[3] {
 		case "idle":
 			idle[cpuNumber], err = strconv.ParseFloat(fields[4], 64)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse idle: %s", err)
+				return nil, fmt.Errorf("cannot parse idle: %w", err)
 			}
 		case "user":
 			user[cpuNumber], err = strconv.ParseFloat(fields[4], 64)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse user: %s", err)
+				return nil, fmt.Errorf("cannot parse user: %w", err)
 			}
 		case "kernel":
 			kern[cpuNumber], err = strconv.ParseFloat(fields[4], 64)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse kernel: %s", err)
+				return nil, fmt.Errorf("cannot parse kernel: %w", err)
 			}
 		case "iowait":
 			iowt[cpuNumber], err = strconv.ParseFloat(fields[4], 64)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse iowait: %s", err)
+				return nil, fmt.Errorf("cannot parse iowait: %w", err)
 			}
-			//not sure how this translates, don't report, add to kernel, something else?
+			// not sure how this translates, don't report, add to kernel, something else?
 			/*case "swap":
 			swap[cpuNumber], err = strconv.ParseFloat(fields[4], 64)
 			if err != nil {
@@ -122,37 +119,29 @@ func Info() ([]InfoStat, error) {
 }
 
 func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
-	psrInfo, err := exec.LookPath("psrinfo")
+	psrInfoOut, err := invoke.CommandWithContext(ctx, "psrinfo", "-p", "-v")
 	if err != nil {
-		return nil, fmt.Errorf("cannot find psrinfo: %s", err)
-	}
-	psrInfoOut, err := invoke.CommandWithContext(ctx, psrInfo, "-p", "-v")
-	if err != nil {
-		return nil, fmt.Errorf("cannot execute psrinfo: %s", err)
-	}
-
-	isaInfo, err := exec.LookPath("isainfo")
-	if err != nil {
-		return nil, fmt.Errorf("cannot find isainfo: %s", err)
-	}
-	isaInfoOut, err := invoke.CommandWithContext(ctx, isaInfo, "-b", "-v")
-	if err != nil {
-		return nil, fmt.Errorf("cannot execute isainfo: %s", err)
+		return nil, fmt.Errorf("cannot execute psrinfo: %w", err)
 	}
 
 	procs, err := parseProcessorInfo(string(psrInfoOut))
 	if err != nil {
-		return nil, fmt.Errorf("error parsing psrinfo output: %s", err)
+		return nil, fmt.Errorf("error parsing psrinfo output: %w", err)
+	}
+
+	isaInfoOut, err := invoke.CommandWithContext(ctx, "isainfo", "-b", "-v")
+	if err != nil {
+		return nil, fmt.Errorf("cannot execute isainfo: %w", err)
 	}
 
 	flags, err := parseISAInfo(string(isaInfoOut))
 	if err != nil {
-		return nil, fmt.Errorf("error parsing isainfo output: %s", err)
+		return nil, fmt.Errorf("error parsing isainfo output: %w", err)
 	}
 
 	result := make([]InfoStat, 0, len(flags))
-	for _, proc := range procs {
-		procWithFlags := proc
+	for i := range procs {
+		procWithFlags := procs[i]
 		procWithFlags.Flags = flags
 		result = append(result, procWithFlags)
 	}
@@ -160,7 +149,7 @@ func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
 	return result, nil
 }
 
-var flagsMatch = regexp.MustCompile(`[\w\.]+`)
+var flagsMatch = regexp.MustCompile(`[\w.]+`)
 
 func parseISAInfo(cmdOutput string) ([]string, error) {
 	words := flagsMatch.FindAllString(cmdOutput, -1)
@@ -170,16 +159,13 @@ func parseISAInfo(cmdOutput string) ([]string, error) {
 		return nil, errors.New("attempted to parse invalid isainfo output")
 	}
 
-	flags := make([]string, len(words)-4)
-	for i, val := range words[4:] {
-		flags[i] = val
-	}
+	flags := words[4:]
 	sort.Strings(flags)
 
 	return flags, nil
 }
 
-var psrInfoMatch = regexp.MustCompile(`The physical processor has (?:([\d]+) virtual processor \(([\d]+)\)|([\d]+) cores and ([\d]+) virtual processors[^\n]+)\n(?:\s+ The core has.+\n)*\s+.+ \((\w+) ([\S]+) family (.+) model (.+) step (.+) clock (.+) MHz\)\n[\s]*(.*)`)
+var psrInfoMatch = regexp.MustCompile(`The physical processor has (?:([\d]+) virtual processors? \(([\d-]+)\)|([\d]+) cores and ([\d]+) virtual processors[^\n]+)\n(?:\s+ The core has.+\n)*\s+.+ \((\w+) ([\S]+) family (.+) model (.+) step (.+) clock (.+) MHz\)\n[\s]*(.*)`)
 
 const (
 	psrNumCoresOffset   = 1
@@ -205,7 +191,7 @@ func parseProcessorInfo(cmdOutput string) ([]InfoStat, error) {
 		if physicalCPU[psrStepOffset] != "" {
 			stepParsed, err := strconv.ParseInt(physicalCPU[psrStepOffset], 10, 32)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse value %q for step as 32-bit integer: %s", physicalCPU[9], err)
+				return nil, fmt.Errorf("cannot parse value %q for step as 32-bit integer: %w", physicalCPU[9], err)
 			}
 			step = int32(stepParsed)
 		}
@@ -213,7 +199,7 @@ func parseProcessorInfo(cmdOutput string) ([]InfoStat, error) {
 		if physicalCPU[psrClockOffset] != "" {
 			clockParsed, err := strconv.ParseInt(physicalCPU[psrClockOffset], 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse value %q for clock as 32-bit integer: %s", physicalCPU[10], err)
+				return nil, fmt.Errorf("cannot parse value %q for clock as 32-bit integer: %w", physicalCPU[10], err)
 			}
 			clock = float64(clockParsed)
 		}
@@ -225,7 +211,7 @@ func parseProcessorInfo(cmdOutput string) ([]InfoStat, error) {
 		case physicalCPU[psrNumCoresOffset] != "":
 			numCores, err = strconv.ParseInt(physicalCPU[psrNumCoresOffset], 10, 32)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse value %q for core count as 32-bit integer: %s", physicalCPU[1], err)
+				return nil, fmt.Errorf("cannot parse value %q for core count as 32-bit integer: %w", physicalCPU[1], err)
 			}
 
 			for i := 0; i < int(numCores); i++ {
@@ -246,12 +232,12 @@ func parseProcessorInfo(cmdOutput string) ([]InfoStat, error) {
 		case physicalCPU[psrNumCoresHTOffset] != "":
 			numCores, err = strconv.ParseInt(physicalCPU[psrNumCoresHTOffset], 10, 32)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse value %q for core count as 32-bit integer: %s", physicalCPU[3], err)
+				return nil, fmt.Errorf("cannot parse value %q for core count as 32-bit integer: %w", physicalCPU[3], err)
 			}
 
 			numHT, err = strconv.ParseInt(physicalCPU[psrNumHTOffset], 10, 32)
 			if err != nil {
-				return nil, fmt.Errorf("cannot parse value %q for hyperthread count as 32-bit integer: %s", physicalCPU[4], err)
+				return nil, fmt.Errorf("cannot parse value %q for hyperthread count as 32-bit integer: %w", physicalCPU[4], err)
 			}
 
 			for i := 0; i < int(numCores); i++ {
@@ -276,6 +262,6 @@ func parseProcessorInfo(cmdOutput string) ([]InfoStat, error) {
 	return result, nil
 }
 
-func CountsWithContext(ctx context.Context, logical bool) (int, error) {
+func CountsWithContext(_ context.Context, _ bool) (int, error) {
 	return runtime.NumCPU(), nil
 }

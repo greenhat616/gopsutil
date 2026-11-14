@@ -1,47 +1,44 @@
-// +build !darwin,!linux,!freebsd,!openbsd,!solaris,!windows
+// SPDX-License-Identifier: BSD-3-Clause
+//go:build !darwin && !linux && !freebsd && !openbsd && !netbsd && !solaris && !windows && !aix
 
 package host
 
 import (
 	"context"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func HostIDWithContext(ctx context.Context) (string, error) {
+func HostIDWithContext(_ context.Context) (string, error) {
 	return "", common.ErrNotImplementedError
 }
 
-func numProcs(ctx context.Context) (uint64, error) {
+func numProcs(_ context.Context) (uint64, error) {
 	return 0, common.ErrNotImplementedError
 }
 
-func BootTimeWithContext(ctx context.Context) (uint64, error) {
+func BootTimeWithContext(_ context.Context) (uint64, error) {
 	return 0, common.ErrNotImplementedError
 }
 
-func UptimeWithContext(ctx context.Context) (uint64, error) {
+func UptimeWithContext(_ context.Context) (uint64, error) {
 	return 0, common.ErrNotImplementedError
 }
 
-func UsersWithContext(ctx context.Context) ([]UserStat, error) {
+func UsersWithContext(_ context.Context) ([]UserStat, error) {
 	return []UserStat{}, common.ErrNotImplementedError
 }
 
-func VirtualizationWithContext(ctx context.Context) (string, string, error) {
+func VirtualizationWithContext(_ context.Context) (string, string, error) {
 	return "", "", common.ErrNotImplementedError
 }
 
-func KernelVersionWithContext(ctx context.Context) (string, error) {
+func KernelVersionWithContext(_ context.Context) (string, error) {
 	return "", common.ErrNotImplementedError
 }
 
-func PlatformInformationWithContext(ctx context.Context) (string, string, string, error) {
+func PlatformInformationWithContext(_ context.Context) (string, string, string, error) {
 	return "", "", "", common.ErrNotImplementedError
-}
-
-func SensorsTemperaturesWithContext(ctx context.Context) ([]TemperatureStat, error) {
-	return []TemperatureStat{}, common.ErrNotImplementedError
 }
 
 func KernelArch() (string, error) {

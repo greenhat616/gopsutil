@@ -1,80 +1,72 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package disk
 
 import (
-	"fmt"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
 
-	"github.com/shirou/gopsutil/internal/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-func skipIfNotImplementedErr(t *testing.T, err error) {
-	if err == common.ErrNotImplementedError {
-		t.Skip("not implemented")
-	}
-}
-
-func TestDisk_usage(t *testing.T) {
+func TestUsage(t *testing.T) {
 	path := "/"
 	if runtime.GOOS == "windows" {
 		path = "C:"
 	}
 	v, err := Usage(path)
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
-	if v.Path != path {
-		t.Errorf("error %v", err)
-	}
+
+	require.NoError(t, err)
+	assert.Equalf(t, v.Path, path, "error %v", err)
 }
 
-func TestDisk_partitions(t *testing.T) {
+func TestPartitions(t *testing.T) {
 	ret, err := Partitions(false)
-	skipIfNotImplementedErr(t, err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
+	}
+
 	if err != nil || len(ret) == 0 {
 		t.Errorf("error %v", err)
 	}
 	t.Log(ret)
 
-	empty := PartitionStat{}
-	if len(ret) == 0 {
-		t.Errorf("ret is empty")
-	}
+	assert.NotEmptyf(t, ret, "ret is empty")
 	for _, disk := range ret {
-		if disk == empty {
-			t.Errorf("Could not get device info %v", disk)
-		}
+		assert.NotEmptyf(t, disk.Device, "Could not get device info %v", disk)
 	}
 }
 
-func TestDisk_io_counters(t *testing.T) {
+func TestIOCounters(t *testing.T) {
 	ret, err := IOCounters()
-	skipIfNotImplementedErr(t, err)
-	if err != nil {
-		t.Errorf("error %v", err)
+	if errors.Is(err, common.ErrNotImplementedError) {
+		t.Skip("not implemented")
 	}
-	if len(ret) == 0 {
-		t.Errorf("ret is empty")
-	}
+
+	require.NoError(t, err)
+	assert.NotEmptyf(t, ret, "ret is empty")
 	empty := IOCountersStat{}
 	for part, io := range ret {
 		t.Log(part, io)
-		if io == empty {
-			t.Errorf("io_counter error %v, %v", part, io)
-		}
+		assert.NotEqualf(t, io, empty, "io_counter error %v, %v", part, io)
 	}
 }
 
 // https://github.com/shirou/gopsutil/issues/560 regression test
-func TestDisk_io_counters_concurrency_on_darwin_cgo(t *testing.T) {
+func TestIOCounters_concurrency_on_darwin_cgo(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("darwin only")
 	}
 	var wg sync.WaitGroup
-	const max = 1000
-	for i := 1; i < max; i++ {
+	const maxCount = 1000
+	for i := 1; i < maxCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -84,7 +76,7 @@ func TestDisk_io_counters_concurrency_on_darwin_cgo(t *testing.T) {
 	wg.Wait()
 }
 
-func TestDiskUsageStat_String(t *testing.T) {
+func TestUsageStat_String(t *testing.T) {
 	v := UsageStat{
 		Path:              "/",
 		Total:             1000,
@@ -98,25 +90,21 @@ func TestDiskUsageStat_String(t *testing.T) {
 		Fstype:            "ext4",
 	}
 	e := `{"path":"/","fstype":"ext4","total":1000,"free":2000,"used":3000,"usedPercent":50.1,"inodesTotal":4000,"inodesUsed":5000,"inodesFree":6000,"inodesUsedPercent":49.1}`
-	if e != fmt.Sprintf("%v", v) {
-		t.Errorf("DiskUsageStat string is invalid: %v", v)
-	}
+	assert.JSONEqf(t, e, v.String(), "DiskUsageStat string is invalid: %v", v)
 }
 
-func TestDiskPartitionStat_String(t *testing.T) {
+func TestPartitionStat_String(t *testing.T) {
 	v := PartitionStat{
 		Device:     "sd01",
 		Mountpoint: "/",
 		Fstype:     "ext4",
-		Opts:       "ro",
+		Opts:       []string{"ro"},
 	}
-	e := `{"device":"sd01","mountpoint":"/","fstype":"ext4","opts":"ro"}`
-	if e != fmt.Sprintf("%v", v) {
-		t.Errorf("DiskUsageStat string is invalid: %v", v)
-	}
+	e := `{"device":"sd01","mountpoint":"/","fstype":"ext4","opts":["ro"]}`
+	assert.JSONEqf(t, e, v.String(), "DiskUsageStat string is invalid: %v", v)
 }
 
-func TestDiskIOCountersStat_String(t *testing.T) {
+func TestIOCountersStat_String(t *testing.T) {
 	v := IOCountersStat{
 		Name:         "sd01",
 		ReadCount:    100,
@@ -126,7 +114,5 @@ func TestDiskIOCountersStat_String(t *testing.T) {
 		SerialNumber: "SERIAL",
 	}
 	e := `{"readCount":100,"mergedReadCount":0,"writeCount":200,"mergedWriteCount":0,"readBytes":300,"writeBytes":400,"readTime":0,"writeTime":0,"iopsInProgress":0,"ioTime":0,"weightedIO":0,"name":"sd01","serialNumber":"SERIAL","label":""}`
-	if e != fmt.Sprintf("%v", v) {
-		t.Errorf("DiskUsageStat string is invalid: %v", v)
-	}
+	assert.JSONEqf(t, e, v.String(), "DiskUsageStat string is invalid: %v", v)
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-3-Clause
 package cpu
 
 import (
@@ -10,20 +11,23 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/shirou/gopsutil/internal/common"
 	"github.com/tklauser/go-sysconf"
 	"golang.org/x/sys/unix"
+
+	"github.com/shirou/gopsutil/v4/internal/common"
 )
 
-var ClocksPerSec = float64(128)
-var cpuMatch = regexp.MustCompile(`^CPU:`)
-var originMatch = regexp.MustCompile(`Origin\s*=\s*"(.+)"\s+Id\s*=\s*(.+)\s+Family\s*=\s*(.+)\s+Model\s*=\s*(.+)\s+Stepping\s*=\s*(.+)`)
-var featuresMatch = regexp.MustCompile(`Features=.+<(.+)>`)
-var featuresMatch2 = regexp.MustCompile(`Features2=[a-f\dx]+<(.+)>`)
-var cpuEnd = regexp.MustCompile(`^Trying to mount root`)
-var cpuCores = regexp.MustCompile(`FreeBSD/SMP: (\d*) package\(s\) x (\d*) core\(s\)`)
-var cpuTimesSize int
-var emptyTimes cpuTimes
+var (
+	ClocksPerSec   = float64(128)
+	cpuMatch       = regexp.MustCompile(`^CPU:`)
+	originMatch    = regexp.MustCompile(`Origin\s*=\s*"(.+)"\s+Id\s*=\s*(.+)\s+Family\s*=\s*(.+)\s+Model\s*=\s*(.+)\s+Stepping\s*=\s*(.+)`)
+	featuresMatch  = regexp.MustCompile(`Features=.+<(.+)>`)
+	featuresMatch2 = regexp.MustCompile(`Features2=[a-f\dx]+<(.+)>`)
+	cpuEnd         = regexp.MustCompile(`^Trying to mount root`)
+	cpuCores       = regexp.MustCompile(`FreeBSD/SMP: (\d*) package\(s\) x (\d*) core\(s\)`)
+	cpuTimesSize   int
+	emptyTimes     cpuTimes
+)
 
 func init() {
 	clkTck, err := sysconf.Sysconf(sysconf.SC_CLK_TCK)
@@ -48,7 +52,7 @@ func Times(percpu bool) ([]TimesStat, error) {
 	return TimesWithContext(context.Background(), percpu)
 }
 
-func TimesWithContext(ctx context.Context, percpu bool) ([]TimesStat, error) {
+func TimesWithContext(_ context.Context, percpu bool) ([]TimesStat, error) {
 	if percpu {
 		buf, err := unix.SysctlRaw("kern.cp_times")
 		if err != nil {
@@ -77,6 +81,9 @@ func TimesWithContext(ctx context.Context, percpu bool) ([]TimesStat, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(buf) < int(unsafe.Sizeof(cpuTimes{})) {
+		return nil, fmt.Errorf("unexpected size: kern.cp_time, %d", len(buf))
+	}
 
 	times := (*cpuTimes)(unsafe.Pointer(&buf[0]))
 	return []TimesStat{*timeStat("cpu-total", times)}, nil
@@ -89,7 +96,7 @@ func Info() ([]InfoStat, error) {
 	return InfoWithContext(context.Background())
 }
 
-func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
+func InfoWithContext(_ context.Context) ([]InfoStat, error) {
 	const dmesgBoot = "/var/run/dmesg.boot"
 
 	c, num, err := parseDmesgBoot(dmesgBoot)
@@ -122,7 +129,11 @@ func InfoWithContext(ctx context.Context) ([]InfoStat, error) {
 
 func parseDmesgBoot(fileName string) (InfoStat, int, error) {
 	c := InfoStat{}
-	lines, _ := common.ReadLines(fileName)
+	lines, err := common.ReadLines(fileName)
+	if err != nil {
+		return c, 0, fmt.Errorf("could not read %s: %w", fileName, err)
+	}
+
 	cpuNum := 1 // default cpu num is 1
 	for _, line := range lines {
 		if matches := cpuEnd.FindStringSubmatch(line); matches != nil {
@@ -133,7 +144,7 @@ func parseDmesgBoot(fileName string) (InfoStat, int, error) {
 			c.Model = matches[4]
 			t, err := strconv.ParseInt(matches[5], 10, 32)
 			if err != nil {
-				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU stepping information from %q: %v", line, err)
+				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU stepping information from %q: %w", line, err)
 			}
 			c.Stepping = int32(t)
 		} else if matches := featuresMatch.FindStringSubmatch(line); matches != nil {
@@ -147,12 +158,12 @@ func parseDmesgBoot(fileName string) (InfoStat, int, error) {
 		} else if matches := cpuCores.FindStringSubmatch(line); matches != nil {
 			t, err := strconv.ParseInt(matches[1], 10, 32)
 			if err != nil {
-				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU Nums from %q: %v", line, err)
+				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU Nums from %q: %w", line, err)
 			}
 			cpuNum = int(t)
 			t2, err := strconv.ParseInt(matches[2], 10, 32)
 			if err != nil {
-				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU cores from %q: %v", line, err)
+				return c, 0, fmt.Errorf("unable to parse FreeBSD CPU cores from %q: %w", line, err)
 			}
 			c.Cores = int32(t2)
 		}
@@ -161,6 +172,15 @@ func parseDmesgBoot(fileName string) (InfoStat, int, error) {
 	return c, cpuNum, nil
 }
 
-func CountsWithContext(ctx context.Context, logical bool) (int, error) {
+func CountsWithContext(_ context.Context, logical bool) (int, error) {
+	// Use system-wide counts for both, so that the logical count is not
+	// smaller than the physical one inside a jail or cpuset.
+	name := "hw.ncpu"
+	if !logical {
+		name = "kern.smp.cores"
+	}
+	if n, err := unix.SysctlUint32(name); err == nil && n > 0 {
+		return int(n), nil
+	}
 	return runtime.NumCPU(), nil
 }
